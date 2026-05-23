@@ -27,11 +27,19 @@ Daily log of what was done, what was observed, and what's next.
 - Three storage layers: instance local SSD (lost on terminate) vs persistent filesystem vs snapshot
 
 ### Status
-- [ ] `pip install transformers accelerate` — pending
-- [ ] Download GPT-2
-- [ ] Create `~/inference_fundamentals/` directory
-- [ ] Run end-to-end verify script
+- [x] `pip install transformers accelerate` — transformers 5.9.0, accelerate 1.13.0
+- [x] Fixed Pillow version (`pip install --upgrade Pillow`) — system Pillow too old for transformers 5.x
+- [x] Set up GitHub repo (`inference_fundamentals`) and cloned on instance
+- [x] Downloaded GPT-2 — 124M params, 548MB, cached at ~/.cache/huggingface/hub/
+- [x] Ran verify_setup.py — full end-to-end inference working
 - [ ] Take snapshot
 
+### Observations from verify_setup.py
+- VRAM total: 42.4 GB (A100 SXM4 40GB reports ~42.4GB due to ECC overhead)
+- input_ids: tensor([[15496, 11, 11362, 0]]) — "Hello, GPU!" splits into 4 BPE tokens
+- attention_mask: tensor([[1, 1, 1, 1]]) — all 1s, no padding on single sequence
+- output shape: (1, 24) = 4 input tokens + 20 generated tokens
+- Generated: "Hello, GPU!\n\nI'm not sure if you've heard of the GPU, but it's a very popular"
+
 ### Next Session
-Continue setup: install transformers, download GPT-2, run verify script, take snapshot. Then start Phase 1 (`run_gpt2_inference.md`).
+Take snapshot, then start Phase 1 (`run_gpt2_inference.md`) — create dataset.py, inference_baseline.py, inference_profile.py.
