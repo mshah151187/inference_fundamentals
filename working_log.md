@@ -43,3 +43,43 @@ Daily log of what was done, what was observed, and what's next.
 
 ### Next Session
 Take snapshot, then start Phase 1 (`run_gpt2_inference.md`) — create dataset.py, inference_baseline.py, inference_profile.py.
+
+---
+
+## 2026-05-25
+
+### What We Did
+- Created `scripts/dataset.py` — synthetic prompt dataset (SHORT/MEDIUM/LONG mix, n=50)
+- Created `scripts/inference_baseline.py` — Phase 1 baseline: 50 prompts, measures throughput (tokens/sec) and avg latency (ms/request), no profiling overhead
+- Created `torch_profiler/inference_profile.py` — Phase 1 profiling: 10 prompts, torch.profiler with CPU+CUDA activities, exports top ops tables + Perfetto trace
+- Added `knowledge_base/profiler.md` and `torch_profiler/torch_profiler.md` — reference docs
+- Added `tensor_pin_memory/` — pageable vs pinned memory deep dive
+
+### Phase 1 Results — TO BE FILLED IN
+Run on A100 instance, then record here:
+
+| Metric | Value |
+|--------|-------|
+| Hardware | A100-SXM4-40GB |
+| Prompts | 50 |
+| Total tokens | |
+| Elapsed (s) | |
+| Throughput (tokens/sec) | |
+| Avg latency (ms/req) | |
+
+**Top ops by CUDA time (from inference_profile.py):**
+
+| Op | CUDA % | CUDA time | # Calls |
+|----|--------|-----------|---------|
+| | | | |
+| | | | |
+| | | | |
+
+**Compute-bound or memory-bound?** (circle one + brief reason):
+
+### Next Session
+- Spin up Lambda Labs A100 (`bash scripts/setup_instance.sh`)
+- Run `python3 scripts/inference_baseline.py` → fill in results table above
+- Run `python3 torch_profiler/inference_profile.py` → fill in top ops table
+- Download `torch_profiler/inference_trace.json` → open in Perfetto UI
+- Phase 2: batching experiments (batch_size = 1, 4, 16, 32)

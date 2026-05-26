@@ -1,8 +1,10 @@
 # Inference Fundamentals
 
-**Goal:** Learn GPU inference from first principles — profiling, batching, compilers, quantization, and deployment.  
+**Goal:** Learn GPU inference from first principles — profiling every optimization step by step to see its real impact.  
 **Model:** GPT-2 (117M) — decoder-only transformer, no auth token, fast iteration.  
-**Hardware:** NVIDIA H100 SXM5 on Lambda Labs ($4.29/hr — spin up only when actively working).
+**Hardware:** NVIDIA A100 SXM4 40GB on Lambda Labs ($1.99/hr — spin up only when actively working).
+
+**Core principle:** PyTorch profiler runs at every phase. Each new technique is measured before and after — you see the delta in the profiler output, not just in theory.
 
 ---
 
@@ -10,45 +12,118 @@
 
 | File | Description |
 |------|-------------|
-| [setup.md](setup.md) | Lambda Labs H100 setup, Python env, GPT-2 download, tmux, snapshots |
+| [setup.md](setup.md) | Lambda Labs A100 setup, Python env, GPT-2 download, tmux, snapshots |
 | [run_gpt2_inference.md](run_gpt2_inference.md) | Phase 1 — baseline inference + PyTorch profiler |
-| *(coming)* | Phase 2 — request batching (naive, bucketed, dynamic) |
-| *(coming)* | Phase 3 — Nsight Systems + Nsight Compute |
-| *(coming)* | Phase 4 — torch.compile + TensorRT |
-| *(coming)* | Phase 5 — Quantization experiments (PTQ, GPTQ, AWQ, FP8, KV cache) |
+| [working_log.md](working_log.md) | Session-by-session log of observations and results |
+| [torch_profiler/torch_profiler.md](torch_profiler/torch_profiler.md) | PyTorch profiler reference — how it works, how to read output |
+| [knowledge_base/profiler.md](knowledge_base/profiler.md) | Overview of all profiling tools (Kineto, Nsight, HTA, Perfetto) |
+| [tensor_pin_memory/script/pinned_memory_transfer.py](tensor_pin_memory/script/pinned_memory_transfer.py) | Pageable vs pinned memory transfer deep dive |
+| *(coming)* | Phase 2 — batching (naive → bucketed → dynamic) |
+| *(coming)* | Phase 3 — warm-up + torch.compile |
+| *(coming)* | Phase 4 — quantization (INT8, INT4, FP8, KV cache) |
+| *(coming)* | Phase 5 — Nsight Systems + Nsight Compute deep dive |
 | *(coming)* | Phase 6 — FastAPI server + Kubernetes deployment |
 
 ---
 
 ## Phase Roadmap
 
-### Phase 1 — Baseline Inference + PyTorch Profiling
-Run GPT-2 on synthetic prompts. Use `torch.profiler` to find the top ops by CUDA time, classify the model as compute-bound or memory-bound, and export a Chrome trace.  
+Profiling is not a one-time activity — it is the measuring instrument at every phase.
+Each phase adds one technique, profiles before and after, and records the delta.
+
+---
+
+### Phase 1 — Baseline Inference + PyTorch Profiler
+
+Run GPT-2 on synthetic prompts with no optimizations. Establish the baseline numbers everything else is measured against.
+
+Profile output answers:
+- What is baseline throughput (tokens/sec) and avg latency (ms/request)?
+- Which ops dominate CUDA time? (aten::mm, aten::baddbmm, aten::softmax)
+- Is GPT-2 compute-bound or memory-bound at batch size 1?
+- How much of wall time is the GPU actually doing work vs idle?
+
 → [run_gpt2_inference.md](run_gpt2_inference.md)
 
-### Phase 2 — Request Batching Strategies
-Compare naive batching (fixed batch + pad to max), bucketing (group by sequence length), and dynamic batching (fill by total token budget). Measure throughput and padding waste for each.
+---
 
-### Phase 3 — Nsight Systems + Nsight Compute
-System-level timeline with Nsight Systems (gaps, H2D transfers, kernel distribution). Kernel-level deep dive with Nsight Compute (roofline, SM utilization, memory bandwidth, occupancy).
+### Phase 2 — Request Batching
 
-### Phase 4 — Compilers
-`torch.compile` with `inductor` backend vs TensorRT via `torch-tensorrt`. Measure speedup, observe op fusion reducing kernel count, compare profile output before and after.
+Add batching and profile the impact at each step.
 
-### Phase 5 — Quantization Experiments
-Apply the quantization techniques you know from theory to real GPT-2 inference on H100. Measure the accuracy vs speed tradeoff for each method.
+**Step 1 — Naive batching:** fixed batch size, pad all sequences to the longest in the batch.  
+**Step 2 — Bucketed batching:** group requests by sequence length into predefined bins (e.g. 64, 128, 256, 512, 1024). Pad only to bin boundary — reduces wasted compute.  
+**Step 3 — Dynamic batching:** collect requests over a short time window, batch whatever arrived. Maximizes GPU utilization without waiting for a full fixed batch.
 
-- **PTQ with bitsandbytes** — INT8 and INT4 via `load_in_8bit` / `load_in_4bit`; compare throughput and perplexity vs FP32 baseline
-- **GPTQ** — weight-only quantization with calibration data; run with `auto-gptq`; profile CUDA ops before/after
-- **AWQ** — activation-aware weight quantization; run with `autoawq`; compare to GPTQ on same prompts
-- **FP8 on H100** — H100's native FP8 Transformer Engine; enable via `transformer_engine` library; measure roofline shift
-- **KV cache quantization** — quantize the KV cache to INT8 to reduce memory footprint during generation; measure max batch size increase
-- **Profile each variant** — use PyTorch profiler on every method; see how the op table changes (fewer bytes moved = memory-bound ops get faster)
+Profile after each step: throughput increase, GPU idle gaps shrinking, padding waste.
 
-Key question to answer: at what quantization level does accuracy degrade noticeably vs the throughput gain? Build a comparison table: method → tokens/sec → perplexity → VRAM usage.
+Key insight: bucketing and dynamic batching solve different problems.
+- Bucketing controls **shape** → finite compiled graphs, bounded padding waste.
+- Dynamic batching controls **batch size** → GPU utilization, latency vs throughput tradeoff.
+- Production uses both together.
+
+---
+
+### Phase 3 — Warm-up + Compilation
+
+**Warm-up:** before opening to traffic, run N dummy inference passes with each expected bucket shape. Absorbs CUDA kernel JIT compilation, memory allocator warm-up, and torch.compile tracing. Without this, first real requests are 10-100× slower than steady state.
+
+Profile: compare first-request latency vs warm request latency. See the cliff.
+
+**torch.compile:** wraps the model with the Inductor backend. On first traced shape, generates fused CUDA kernels — multiple small ops merged into one kernel launch. Subsequent calls hit the compiled path.
+
+Profile after compile: kernel count drops, CUDA time for hot ops decreases, fewer gaps on GPU track.
+
+Key insight: warm-up and compile interact — warm-up triggers compilation for each bucket shape upfront so no real request ever pays the compilation cost.
+
+---
+
+### Phase 4 — Quantization
+
+Apply quantization techniques and profile the impact on each.
+
+- **PTQ INT8** via bitsandbytes — `load_in_8bit`; compare throughput and perplexity vs FP32 baseline
+- **PTQ INT4** via bitsandbytes — `load_in_4bit`; measure memory vs accuracy tradeoff
+- **GPTQ** — weight-only quantization with calibration data; profile CUDA ops before/after
+- **AWQ** — activation-aware weight quantization; compare to GPTQ on same prompts
+- **FP8** — H100/A100 native FP8; measure roofline shift (memory-bound → compute-bound)
+- **KV cache quantization** — INT8 KV cache; measure max batch size increase from VRAM savings
+
+Profile after each: op table changes (aten::mm bytes moved decreases → memory-bound ops speed up), VRAM usage drops, throughput increases.
+
+Key question: at what level does accuracy degrade noticeably vs throughput gain?  
+Deliverable: comparison table — method → tokens/sec → perplexity → VRAM.
+
+---
+
+### Phase 5 — Nsight Deep Dive
+
+By Phase 5 the stack is well-optimized. Now use Nsight to understand what's happening at the hardware level.
+
+**Nsight Systems (nsys):** system-wide timeline — CPU threads, GPU kernels, H2D transfers, gaps. Answers: where are the remaining idle periods? What's the kernel distribution?
+
+**Nsight Compute (ncu):** per-kernel hardware metrics — roofline position, SM utilization, memory bandwidth, occupancy. Answers: why is this specific kernel still slow?
+
+Compare roofline position before and after quantization — see the model shift from memory-bound toward compute-bound as INT8/FP8 reduces bytes moved per op.
+
+---
 
 ### Phase 6 — Containerization + Kubernetes
-FastAPI inference server → Dockerfile with CUDA base image → Kubernetes Deployment with GPU resource limits, liveness/readiness probes, and Service. Practice locally with minikube.
+
+FastAPI inference server → Dockerfile with CUDA base image → Kubernetes Deployment.
+
+Key engineering: readiness probe gates traffic until warm-up completes. Without this, Kubernetes routes requests to a pod that hasn't finished compilation + warm-up yet → first-request latency spike in production.
+
+```
+Startup sequence inside pod:
+  Model Manager downloads from Artifactory (name + group + version)
+      ↓
+  torch.compile(model)
+      ↓
+  Warm-up loop over all bucket shapes
+      ↓
+  Readiness probe passes → Kubernetes routes traffic
+```
 
 ---
 
@@ -57,11 +132,11 @@ FastAPI inference server → Dockerfile with CUDA base image → Kubernetes Depl
 | Phase | Core skill | Talking point |
 |-------|-----------|---------------|
 | 1 | Read profiler output, identify hot ops | "torch.profiler showed 70% of CUDA time in aten::mm — memory-bound at batch size 1" |
-| 2 | Batching tradeoffs | "Dynamic batching by token budget gave 2x+ throughput vs naive fixed-size batching" |
-| 3 | Nsight tools, roofline model | "Nsight Compute placed the GEMM kernel below the memory roofline at batch size 1" |
-| 4 | Compiler internals, op fusion | "torch.compile reduced kernel count by ~40% through operator fusion" |
-| 5 | Quantization methods hands-on | "AWQ at INT4 gave 3x memory reduction with <1% perplexity increase vs FP32 on GPT-2" |
-| 6 | GPU workloads on Kubernetes | "GPU pods need requests==limits; readiness probes gate traffic until model is loaded" |
+| 2 | Batching tradeoffs | "Bucketing controls shape for compilation stability; dynamic batching controls batch size for GPU utilization — production needs both" |
+| 3 | Warm-up + compilation | "Warm-up over all bucket shapes triggers torch.compile tracing upfront — no real request ever pays the compilation cost" |
+| 4 | Quantization hands-on | "AWQ INT4 gave 3x memory reduction with <1% perplexity increase; KV cache INT8 let us double max batch size" |
+| 5 | Nsight roofline | "Nsight Compute placed GPT-2 below the memory roofline at batch size 1; FP8 shifted it toward compute-bound" |
+| 6 | GPU workloads on Kubernetes | "Readiness probe gates traffic until warm-up completes — prevents first-request latency spikes in production" |
 
 ---
 
@@ -69,13 +144,13 @@ FastAPI inference server → Dockerfile with CUDA base image → Kubernetes Depl
 
 | Phase | Estimated time | Cost |
 |-------|---------------|------|
-| Setup | 0.5 hr | ~$2 |
-| Phase 1 | 2 hr | ~$9 |
-| Phase 2 | 2 hr | ~$9 |
-| Phase 3 | 3 hr | ~$13 |
-| Phase 4 | 3 hr | ~$13 |
-| Phase 5 | 3 hr | ~$13 |
-| Phase 6 | 2 hr | ~$9 |
-| **Total** | **~15.5 hr** | **~$68** |
+| Setup | 0.5 hr | ~$1 |
+| Phase 1 | 2 hr | ~$4 |
+| Phase 2 | 2 hr | ~$4 |
+| Phase 3 | 2 hr | ~$4 |
+| Phase 4 | 3 hr | ~$6 |
+| Phase 5 | 3 hr | ~$6 |
+| Phase 6 | 2 hr | ~$4 |
+| **Total** | **~14.5 hr** | **~$29** |
 
 > Filesystem snapshot preserves your env between sessions (~$0.20/GB/month for storage).
