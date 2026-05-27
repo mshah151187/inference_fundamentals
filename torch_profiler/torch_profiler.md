@@ -93,19 +93,22 @@ First-ever inference is slower because CUDA JIT-compiles kernels on first use an
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
 ```
 
-Sample output:
+Sample output (sorted by `cuda_time_total`, with `profile_memory=True`):
 ```
----------------------------------  --------  --------  --------  --------  --------
-Name                               CPU %     CPU time  CUDA %    CUDA time  # Calls
----------------------------------  --------  --------  --------  --------  --------
-aten::mm                            2.34%    1.200ms   68.12%   34.500ms      2400
-aten::baddbmm                       1.10%    0.560ms   15.30%    7.750ms       480
-aten::softmax                       3.20%    1.640ms    6.10%    3.090ms       480
-aten::addmm                         1.80%    0.920ms    4.20%    2.130ms      1440
-aten::gelu                          2.10%    1.080ms    2.50%    1.270ms       480
-aten::layer_norm                    1.90%    0.970ms    1.80%    0.910ms       960
----------------------------------  --------  --------  --------  --------  --------
+-----------------------------------------------  --------  ----------  --------  ----------  --------  ------------  ------------
+Name                                             CPU %     CPU time    CUDA %    CUDA time   # Calls   Self Mem      Total Mem
+-----------------------------------------------  --------  ----------  --------  ----------  --------  ------------  ------------
+aten::mm                                          2.34%     1.200ms    68.12%    34.500ms      2400      9.18 Mb       9.18 Mb
+aten::baddbmm                                     1.10%     0.560ms    15.30%     7.750ms       480      2.29 Mb       2.29 Mb
+aten::softmax                                     3.20%     1.640ms     6.10%     3.090ms       480      2.29 Mb       2.29 Mb
+aten::addmm                                       1.80%     0.920ms     4.20%     2.130ms      1440      9.18 Mb       9.18 Mb
+aten::gelu                                        2.10%     1.080ms     2.50%     1.270ms       480      3.07 Mb       3.07 Mb
+aten::layer_norm                                  1.90%     0.970ms     1.80%     0.910ms       960      3.07 Mb       3.07 Mb
+-----------------------------------------------  --------  ----------  --------  ----------  --------  ------------  ------------
 ```
+
+- **Self Mem** — HBM bytes allocated by this op for its own output tensor (not counting children)
+- **Total Mem** — HBM bytes allocated by this op + all child ops it calls internally
 
 ### Column Meanings
 
@@ -146,13 +149,14 @@ Look at the top ops by CUDA time:
 - Typical at large batch sizes (batch 32+)
 - To go faster: operator fusion, quantization (INT8/FP8 = 2x tensor core throughput)
 
-**Memory-bound** (not enough parallelism, GPU waits on data):
-- Elementwise ops (`aten::softmax`, `aten::gelu`, `aten::layer_norm`) are a significant share
+**Memory-bound** (low arithmetic intensity, memory bandwidth is the first ceiling you'd hit at scale):
+- Elementwise ops (`aten::softmax`, `aten::gelu`, `aten::layer_norm`) are a significant share of CUDA time
 - Or GEMM % is low even though it's the top op
-- Typical at batch size 1 — each matrix is small, tensor cores finish quickly and wait for next load
-- To go faster: batching (more work per kernel launch), pinned memory + async transfer, KV cache optimization
+- Memory bus is saturated — tensor cores finish quickly and wait for the next HBM load
+- Typical at moderate-to-large batch: enough work to stress the bus, not enough to max tensor cores
+- To go faster: operator fusion (reduces round-trips to HBM), quantization (smaller dtypes = less bandwidth)
 
-**GPT-2 at batch size 1 is memory-bound.** The weight matrices are loaded from VRAM for each forward pass but the compute is tiny (batch=1, seq_len=~50). The GPU loads 548MB of weights, does a small matmul, then waits for the next load.
+**Note on batch=1:** batch=1 is NOT memory-bound in the traditional sense. It is **low-occupancy / underutilized** — neither the memory bus NOR the tensor cores are stressed. The matrix tiles are too small to fill all SMs. See Question 4 below.
 
 ### Question 2: Is my GPU sitting idle while CPU works?
 
@@ -176,6 +180,59 @@ Sort by `cuda_time_total`. The top 3 ops by CUDA time are where optimization eff
 3. `aten::softmax` — attention weights
 
 These are the ops that `torch.compile` fuses, quantization accelerates, and FlashAttention replaces.
+
+### Question 4: How can I tell if the GPU is underutilized — and should I push more work through it?
+
+This question is not answered by a single column. You read a pattern across three signals:
+
+**Signal 1 — Low Self Mem per op:**
+```
+aten::mm    Self Mem: 9.18 Mb    (batch=1, seq=50, d=768)
+aten::mm    Self Mem: 587 Mb     (batch=64, seq=50, d=768)
+```
+Low allocation means small output tensors — small matrices. HBM has headroom to hold activations
+from many more requests simultaneously. Room in memory = room to add more requests.
+
+**Signal 2 — Short absolute CUDA time per op:**
+```
+aten::mm    CUDA time: 34.5ms total / 2400 calls = 0.014ms per call   ← very short kernel
+aten::mm    CUDA time: 890ms total / 2400 calls = 0.37ms per call     ← kernel doing real work
+```
+Short per-call CUDA time means small matrix tiles — kernel launches, does a tiny matmul,
+finishes in microseconds. Most SMs sit idle for the duration. Tensor cores are not occupied.
+
+**Signal 3 — Low total throughput vs theoretical:**
+```
+Observed:    350 tokens/sec   (batch=1, GPT-2 on A100)
+A100 peak:   ~312 TFLOPS FP16
+GPT-2 needs: ~0.6 TFLOPS per token at batch=1
+Utilization: 0.6T / 312T = 0.2%   ← GPU is doing almost nothing
+```
+If your tokens/sec × FLOPs-per-token is a tiny fraction of the GPU's rated TFLOPS, the hardware
+is underutilized regardless of what the profiler says about individual ops.
+
+**What to do when all three signals are low:**
+
+Increase batch size — pack more requests together per forward pass:
+```
+batch=1  → aten::mm tiles are (50, 768) — tiny, SMs idle
+batch=16 → aten::mm tiles are (800, 768) — SMs start filling up
+batch=64 → aten::mm tiles are (3200, 768) — approaching full SM occupancy
+```
+As batch grows: Self Mem increases, CUDA time per op increases, throughput (tokens/sec) increases
+faster than latency — you get more tokens per GPU-second. This is why dynamic batching and
+continuous batching exist in production serving (vLLM, Triton, TensorRT-LLM).
+
+**The limit:** keep increasing batch until either:
+- Self Mem hits HBM capacity → OOM (or CUDA out of memory error)
+- CUDA time stops scaling linearly → you've hit the memory bandwidth ceiling (memory-bound)
+- CUDA time plateaus at high utilization → you've hit the compute ceiling (compute-bound)
+
+**torch.profiler gives you the economic signal. Nsight Compute gives you the physical diagnosis:**
+```
+torch.profiler:   "low memory + short kernels → GPU has room for more work"
+Nsight Compute:   "SM occupancy 4%, tensor core active 1% → confirmed underutilized"
+```
 
 ---
 
