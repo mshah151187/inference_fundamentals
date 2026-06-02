@@ -83,3 +83,40 @@ Run on A100 instance, then record here:
 - Run `python3 torch_profiler/inference_profile.py` → fill in top ops table
 - Download `torch_profiler/inference_trace.json` → open in Perfetto UI
 - Phase 2: batching experiments (batch_size = 1, 4, 16, 32)
+
+---
+
+## 2026-06-02
+
+### What We Did
+- Added knowledge base docs: `flash_attention.md`, `kernel_launch_process.md`, `kv_cache.md`, `PagedAttention.md`, `nvidia_gpu_hardware.md`, `nsight_session_plan.md`
+- Attempted Nsight Systems session on A100 — ran into two issues:
+  1. **CUPTI conflict:** `inference_profile.py` uses `torch.profiler` which registers its own CUPTI subscriber — nsys can't register a second one. Created `nsys_profiler/script/inference_nsys.py` (plain inference, no torch.profiler) to fix this.
+  2. **Version mismatch:** Instance had nsys **2024.6.2** (via apt), Mac GUI is **2026.3.1**. `.qdstrm` files are NOT cross-version compatible — file was unreadable.
+- Clean nsys capture completed (no CUPTI error) but `.qdstrm` unreadable due to version mismatch.
+- Instance terminated.
+
+### Key Learnings
+- Never run nsys against a script that uses `torch.profiler` — CUPTI conflict drops all CUDA kernel data
+- nsys `.qdstrm` format is NOT backward compatible across major versions — GUI version must match CLI version
+- Mac GUI is **2026.3.1** — instance apt only has 2024.6.2
+
+### Next Session — Nsight Systems
+1. Spin up A100 instance: `bash ~/inference_fundamentals/scripts/setup_instance.sh`
+2. **Install matching nsys version FIRST:**
+   ```bash
+   apt-cache show nsight-systems | grep Version   # check available
+   sudo apt-get install -y nsight-systems         # install
+   nsys --version                                 # must match Mac GUI 2026.3.x
+   ```
+   If apt doesn't have 2026.3.x, download matching CLI from developer.nvidia.com/nsight-systems
+3. `mkdir -p ~/inference_fundamentals/nsight`
+4. Run nsys with the clean script (no torch.profiler):
+   ```bash
+   nsys profile \
+     --trace=cuda,cudnn,cublas,osrt \
+     --output=/home/ubuntu/inference_fundamentals/nsight/nsys_batch1_clean \
+     --force-overwrite true \
+     python ~/inference_fundamentals/nsys_profiler/script/inference_nsys.py
+   ```
+5. Download `.qdstrm` to Mac and open in Nsight Systems GUI
