@@ -205,11 +205,48 @@ finishes in microseconds. Most SMs sit idle for the duration. Tensor cores are n
 ```
 Observed:    350 tokens/sec   (batch=1, GPT-2 on A100)
 A100 peak:   ~312 TFLOPS FP16
-GPT-2 needs: ~0.6 TFLOPS per token at batch=1
-Utilization: 0.6T / 312T = 0.2%   ← GPU is doing almost nothing
+GPT-2 needs: ~0.24 GFLOP/token (117M params × 2)
+Utilization: 350 × 0.24G / 312T = 0.027%  ← GPU is doing almost nothing
 ```
 If your tokens/sec × FLOPs-per-token is a tiny fraction of the GPU's rated TFLOPS, the hardware
 is underutilized regardless of what the profiler says about individual ops.
+
+**How to get these two numbers:**
+
+*tokens/sec — wall clock in your code (not from the profiler):*
+```python
+import time
+start = time.time()
+outputs = model.generate(input_ids, max_new_tokens=50)
+elapsed = time.time() - start
+
+tokens_generated = outputs.shape[1] - input_ids.shape[1]  # new tokens only
+tokens_per_sec = tokens_generated / elapsed
+```
+
+*FLOPs/token — two ways:*
+
+Way 1 — from the profiler (`with_flops=True` already set in inference_profile.py):
+```python
+events = prof.key_averages()
+total_flops = sum(getattr(e, 'flops', 0) for e in events)
+flops_per_token = total_flops / tokens_generated
+```
+Only counts ops with known FLOP formulas (aten::mm, aten::addmm, aten::baddbmm, aten::bmm).
+Elementwise ops (softmax, gelu, layer_norm) report 0 — so this is an undercount.
+Good for relative comparison across phases, not absolute GPU utilization.
+
+Way 2 — analytical rule of thumb (see profiling_guide.md):
+```
+FLOPs/token ≈ 2 × num_parameters
+
+GPT-2 small  (117M): ~234 MFLOPS/token
+GPT-2 medium (345M): ~690 MFLOPS/token
+```
+Comes from: each parameter is a weight in a matmul → 1 multiply + 1 add per weight per token.
+
+Use Way 2 for the utilization check (it's fast and accurate enough).
+Use Way 1 to track which ops account for what fraction of total FLOPS as you optimize.
 
 **What to do when all three signals are low:**
 
@@ -233,6 +270,10 @@ continuous batching exist in production serving (vLLM, Triton, TensorRT-LLM).
 torch.profiler:   "low memory + short kernels → GPU has room for more work"
 Nsight Compute:   "SM occupancy 4%, tensor core active 1% → confirmed underutilized"
 ```
+
+For the full step-by-step pipeline of what happens between Python and GPU execution
+(dispatcher, cuBLAS, algorithm selection, cudaLaunchKernel, tensor core GEMM):
+→ See `knowledge_base/kernel_launch_process.md`
 
 ---
 

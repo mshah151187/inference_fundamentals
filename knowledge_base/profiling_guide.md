@@ -155,18 +155,53 @@ Ratio >> 1 with large absolute CPU time: severe CPU bottleneck — investigate d
 
 ```
 GPU utilization % = (tokens/sec × FLOPs/token) / GPU peak TFLOPS × 100
-
-GPT-2 117M on A100 at batch=1:
-  ~400 tokens/sec × 0.24 GFLOP/token = 96 GFLOP/sec
-  96 GFLOP/sec / 312,000 GFLOP/sec = 0.03%  ← almost nothing
-
-GPT-2 117M on A100 at batch=64 (target):
-  ~8,000 tokens/sec × 0.24 GFLOP/token = 1,920 GFLOP/sec
-  1,920 / 312,000 = 0.6%  ← still very low for a 117M model
-  (GPT-2 is too small to stress A100 even at large batch)
 ```
 
-If utilization < 1% → fix pipeline (batching, memory transfer) before touching kernels.
+**How to get tokens/sec** — wall clock around `model.generate()`, not from the profiler:
+```python
+import time
+start = time.time()
+outputs = model.generate(input_ids, max_new_tokens=50)
+elapsed = time.time() - start
+tokens_per_sec = (outputs.shape[1] - input_ids.shape[1]) / elapsed
+```
+
+**How to get FLOPs/token** — analytical rule of thumb for transformers:
+```
+FLOPs/token ≈ 2 × num_parameters
+
+Derivation: each parameter is a weight in a matmul.
+  Each forward pass multiplies input by that weight (1 multiply + 1 add = 2 FLOPs).
+  For a single new token in decode phase → all weights touched once → 2 × N FLOPs.
+
+GPT-2 small  (117M params): ~234 MFLOPS/token  =  0.234 GFLOPS/token
+GPT-2 medium (345M params): ~690 MFLOPS/token  =  0.690 GFLOPS/token
+LLaMA-7B     (7B params):   ~14 GFLOPS/token
+LLaMA-70B    (70B params):  ~140 GFLOPS/token
+```
+
+Note: this is the decode phase rule (one new token per pass). Prefill multiplies by
+prompt length — processing 512 prompt tokens = 512× the FLOPs of one decode step.
+
+Also available from torch.profiler with `with_flops=True` — but only matmul ops report
+FLOPS (aten::mm, aten::addmm, aten::baddbmm). Elementwise ops report 0 — undercount.
+Use the 2×N rule for the utilization check; use profiler FLOPS to track op-level share.
+
+```
+GPT-2 117M on A100 at batch=1:
+  ~400 tokens/sec × 0.234 GFLOP/token = 93.6 GFLOP/sec
+  93.6 GFLOP/sec / 312,000 GFLOP/sec = 0.03%  ← almost nothing
+
+GPT-2 117M on A100 at batch=64 (target):
+  ~8,000 tokens/sec × 0.234 GFLOP/token = 1,872 GFLOP/sec
+  1,872 / 312,000 = 0.6%  ← still very low (GPT-2 is too small to stress A100)
+
+LLaMA-7B on A100 at batch=64:
+  ~3,000 tokens/sec × 14 GFLOP/token = 42,000 GFLOP/sec
+  42,000 / 312,000 = 13.5%  ← starting to see real utilization
+```
+
+If utilization < 1%  → fix pipeline (batching, memory transfer) before touching kernels.
 If utilization 1–30% → batching helps, consider continuous batching.
 If utilization > 60% → well-utilized, optimize at kernel level (fusion, quantization).
 

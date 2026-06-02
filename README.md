@@ -20,9 +20,10 @@
 | [tensor_pin_memory/script/pinned_memory_transfer.py](tensor_pin_memory/script/pinned_memory_transfer.py) | Pageable vs pinned memory transfer deep dive |
 | *(coming)* | Phase 2 — batching (naive → bucketed → dynamic) |
 | *(coming)* | Phase 3 — warm-up + torch.compile |
-| *(coming)* | Phase 4 — quantization (INT8, INT4, FP8, KV cache) |
-| *(coming)* | Phase 5 — Nsight Systems + Nsight Compute deep dive |
-| *(coming)* | Phase 6 — FastAPI server + Kubernetes deployment |
+| *(coming)* | Phase 4 — KV cache implementation |
+| *(coming)* | Phase 5 — quantization (INT8, INT4, FP8, KV cache) |
+| *(coming)* | Phase 6 — Nsight Systems + Nsight Compute deep dive |
+| *(coming)* | Phase 7 — FastAPI server + Kubernetes deployment |
 
 ---
 
@@ -78,7 +79,39 @@ Key insight: warm-up and compile interact — warm-up triggers compilation for e
 
 ---
 
-### Phase 4 — Quantization
+### Phase 4 — KV Cache Implementation
+
+Understand and implement KV cache from first principles, profiling the impact at each step.
+
+**Step 1 — Observe the problem (done):**
+Profiler shows `aten::cat` as a top CUDA time op with 1.12 GB memory footprint.
+Root cause: dynamic KV cache growth via `torch.cat` — allocates new tensor + copies all
+existing K/V vectors on every decode step. Cumulative cost is O(seq_len²).
+
+**Step 2 — Study vLLM source:**
+- `vllm/attention/backends/` — PagedAttention CUDA kernel
+- `vllm/core/block_manager.py` — block table and free block pool management
+- `vllm/worker/cache_engine.py` — HBM pool initialization at startup
+
+**Step 3 — Implement fixed pre-allocation:**
+Pre-allocate KV cache buffer for `max_seq_len` upfront. Write new K/V in-place at the
+current position — no `torch.cat`, no copying.
+Profile: `aten::cat` memory footprint drops to zero. Measure throughput improvement.
+Downside: memory bubble — HBM reserved for max_seq_len even when actual sequence is short.
+
+**Step 4 — Implement block-based allocation (PagedAttention mechanics):**
+Pre-allocate a shared HBM block pool at startup (block_size = 16 tokens).
+Each request gets a block table mapping logical → physical block.
+Assign blocks from pool on demand — one block per 16 tokens, no contiguous reservation.
+Write K/V in-place to current block; claim new block when full.
+Profile: `aten::cat` gone + HBM waste bounded to (block_size - 1) tokens per request.
+Measure: max concurrent requests vs fixed pre-allocation.
+
+Key references: [knowledge_base/kv_cache.md](knowledge_base/kv_cache.md), [knowledge_base/PagedAttention.md](knowledge_base/PagedAttention.md)
+
+---
+
+### Phase 5 — Quantization
 
 Apply quantization techniques and profile the impact on each.
 
@@ -96,7 +129,7 @@ Deliverable: comparison table — method → tokens/sec → perplexity → VRAM.
 
 ---
 
-### Phase 5 — Nsight Deep Dive
+### Phase 6 — Nsight Deep Dive
 
 By Phase 5 the stack is well-optimized. Now use Nsight to understand what's happening at the hardware level.
 
@@ -108,7 +141,7 @@ Compare roofline position before and after quantization — see the model shift 
 
 ---
 
-### Phase 6 — Containerization + Kubernetes
+### Phase 7 — Containerization + Kubernetes
 
 FastAPI inference server → Dockerfile with CUDA base image → Kubernetes Deployment.
 
@@ -134,9 +167,10 @@ Startup sequence inside pod:
 | 1 | Read profiler output, identify hot ops | "torch.profiler showed 70% of CUDA time in aten::mm — memory-bound at batch size 1" |
 | 2 | Batching tradeoffs | "Bucketing controls shape for compilation stability; dynamic batching controls batch size for GPU utilization — production needs both" |
 | 3 | Warm-up + compilation | "Warm-up over all bucket shapes triggers torch.compile tracing upfront — no real request ever pays the compilation cost" |
-| 4 | Quantization hands-on | "AWQ INT4 gave 3x memory reduction with <1% perplexity increase; KV cache INT8 let us double max batch size" |
-| 5 | Nsight roofline | "Nsight Compute placed GPT-2 below the memory roofline at batch size 1; FP8 shifted it toward compute-bound" |
-| 6 | GPU workloads on Kubernetes | "Readiness probe gates traffic until warm-up completes — prevents first-request latency spikes in production" |
+| 4 | KV cache from scratch | "Replaced aten::cat with pre-allocated buffer — eliminated 1.12 GB cumulative copy cost; then implemented block-based allocation to remove memory bubble" |
+| 5 | Quantization hands-on | "AWQ INT4 gave 3x memory reduction with <1% perplexity increase; KV cache INT8 let us double max batch size" |
+| 6 | Nsight roofline | "Nsight Compute placed GPT-2 below the memory roofline at batch size 1; FP8 shifted it toward compute-bound" |
+| 7 | GPU workloads on Kubernetes | "Readiness probe gates traffic until warm-up completes — prevents first-request latency spikes in production" |
 
 ---
 
@@ -150,7 +184,8 @@ Startup sequence inside pod:
 | Phase 3 | 2 hr | ~$4 |
 | Phase 4 | 3 hr | ~$6 |
 | Phase 5 | 3 hr | ~$6 |
-| Phase 6 | 2 hr | ~$4 |
-| **Total** | **~14.5 hr** | **~$29** |
+| Phase 6 | 3 hr | ~$6 |
+| Phase 7 | 2 hr | ~$4 |
+| **Total** | **~17.5 hr** | **~$35** |
 
 > Filesystem snapshot preserves your env between sessions (~$0.20/GB/month for storage).
