@@ -1,6 +1,6 @@
 # Nsight Systems — Batch=1 OS Runtime Libraries Findings
 
-**Screenshots:** `screenshots/os_runtime_libraries_1.png`, `screenshots/os_runtime_libraries_2.png`
+**Screenshots:** `screenshots/os_runtime_libraries_1.png`, `screenshots/os_runtime_libraries_2.png`, `screenshots/os_runtime_libraries_3.png`
 
 ---
 
@@ -58,11 +58,36 @@ These are not a bottleneck individually. The grey block looks dense because **th
 
 ---
 
+## Observation 4 — ioctl + nanosleep Blocks During Inference
+
+**Screenshot:** `os_runtime_libraries_3.png` — large `ioctl → ioctl → nanosleep` blocks visible at ~4s+49ms, each spanning hundreds of milliseconds. These appear at boundaries between prompts.
+
+These are completely different from the tiny stat64/lstat64 calls — they are **CUDA GPU synchronization**.
+
+**`ioctl`** — the NVIDIA driver communicates with GPU hardware through `/dev/nvidia*` device files using `ioctl`. Two roles:
+1. **Submit work** — CPU sends kernel launch commands down to GPU driver
+2. **Poll completion** — CPU checks whether GPU has finished executing
+
+**`nanosleep`** — CPU thread intentionally sleeps briefly. The CUDA runtime uses a poll + sleep strategy while waiting for GPU completion:
+```
+while GPU not done:
+    ioctl(check status)   ← poll
+    nanosleep(few μs)     ← back off to avoid burning 100% CPU
+    ioctl(check status)   ← poll again
+```
+
+**When does this happen?** At the boundary between prompts — when `model.generate()` returns and PyTorch needs to read the output tokens back from GPU. The CPU must wait for all GPU kernels to finish before proceeding to the next prompt.
+
+**What the Python thread shows simultaneously:** Small green activity spikes just before the ioctl blocks — Python dispatching the last kernels of a prompt, then the thread drops to 0% (blocked in OS waiting for GPU) during the ioctl/nanosleep loop.
+
+---
+
 ## Summary
 
 | Phase | OS Runtime Activity | Cause |
 |---|---|---|
 | Model loading (0 → 2.3s) | Dense grey block | File I/O: open/mmap/stat64/lstat64 on weight files |
 | Warmup + Inference (2.3s+) | Nearly silent | No file I/O — all data in GPU HBM |
+| Between prompts | Large ioctl + nanosleep blocks | CPU waiting for GPU to finish (CUDA synchronization) |
 
-**Key takeaway:** OS Runtime Libraries is not a bottleneck during inference. The burst at startup is expected and one-time. In production serving (model pre-loaded), this phase doesn't exist — the model is already in GPU memory when requests arrive.
+**Key takeaway:** OS Runtime Libraries is not a bottleneck during inference. The file I/O burst at startup is one-time. The ioctl/nanosleep blocks are synchronization overhead — unavoidable when CPU must wait for GPU results before starting the next prompt.
