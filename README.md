@@ -141,6 +141,25 @@ Compare roofline position before and after quantization — see the model shift 
 
 ---
 
+### vllm-tuner Integrations (by Phase)
+
+We studied the [`vllm-tuner`](../Github_Repos/vllm-tuner/) repo (Bayesian optimization for vLLM via Optuna). Most of it is too high-level for our educational goals, but three components map cleanly onto our phases:
+
+| Component | Source file | Where it fits | What it adds |
+|---|---|---|---|
+| **GPU monitor** | `vllm_tuner/profiling/gpu_collector.py` | Phase 2+ | Real-time NVML metrics — GPU utilization, memory used, power draw, SM/memory clocks — alongside torch.profiler op tables |
+| **Async request generator** | `vllm_tuner/benchmarks/request_generator.py` | Phase 2 | AsyncIO pattern for concurrent in-process `model.generate()` calls + latency/throughput tracking |
+| **HTML comparison reports** | `vllm_tuner/reporting/html.py` | Phase 5 | Interactive Plotly dashboards for comparing quantization configs (INT4 vs FP8 vs FP32) |
+
+**What we skip and why:**
+- **Optuna study manager / optimizer** — Bayesian tuning adds abstraction distance from hardware. We want to see *why* each change moves the needle, not just find optimal values.
+- **vLLM server launcher** — we run GPT-2 in-process, not via HTTP server.
+- **Pydantic config models** — overkill at our current experiment scale.
+
+**Immediate next action (Phase 2):** write `scripts/gpu_monitor.py` wrapping `pynvml` — collects utilization, memory, power, clocks — and wire it into batch size sweep experiments.
+
+---
+
 ### Phase 7 — Containerization + Kubernetes
 
 FastAPI inference server → Dockerfile with CUDA base image → Kubernetes Deployment.
