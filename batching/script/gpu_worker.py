@@ -44,15 +44,7 @@ def _extract_kv_slice(past_key_values, batch_idx: int, seq_start: int,
             (past_key_values.key_cache[l], past_key_values.value_cache[l])
             for l in range(num_layers)
         )
-    else:
-        print(f"[DEBUG] past_key_values type={type(past_key_values).__name__}")
-        print(f"[DEBUG] instance attrs: {list(vars(past_key_values).keys())}")
-        if hasattr(past_key_values, 'layers') and past_key_values.layers:
-            layer0 = past_key_values.layers[0]
-            print(f"[DEBUG] layers[0] type={type(layer0).__name__}")
-            print(f"[DEBUG] layers[0] attrs={list(vars(layer0).keys())}")
-            for k, v in vars(layer0).items():
-                print(f"[DEBUG]   .{k}: type={type(v).__name__} shape={getattr(v, 'shape', 'N/A')}")
+    # else: already a legacy tuple of (k, v) tuples — use directly
 
     return tuple(
         (past_key_values[l][0][batch_idx:batch_idx+1, :, seq_start:, :],
