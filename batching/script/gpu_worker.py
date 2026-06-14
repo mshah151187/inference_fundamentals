@@ -30,6 +30,26 @@ HEAD_DIM     = 64
 EOS_TOKEN_ID = 50256
 
 
+def _extract_kv_slice(past_key_values, batch_idx: int, seq_start: int,
+                      num_layers: int) -> tuple:
+    """Extract KV for one request from a batched past_key_values.
+    Handles both DynamicCache (transformers >= 4.36) and legacy tuple-of-tuples.
+    Returns a legacy tuple of (k, v) pairs, one per layer.
+      k shape: [1, num_heads, seq_len, head_dim]
+    """
+    if hasattr(past_key_values, 'key_cache'):
+        return tuple(
+            (past_key_values.key_cache[l][batch_idx:batch_idx+1, :, seq_start:, :],
+             past_key_values.value_cache[l][batch_idx:batch_idx+1, :, seq_start:, :])
+            for l in range(num_layers)
+        )
+    return tuple(
+        (past_key_values[l][0][batch_idx:batch_idx+1, :, seq_start:, :],
+         past_key_values[l][1][batch_idx:batch_idx+1, :, seq_start:, :])
+        for l in range(num_layers)
+    )
+
+
 class GPUWorker:
 
     def __init__(self):
@@ -64,24 +84,52 @@ class GPUWorker:
         torch.cuda.synchronize()
         return gpu_t.unsqueeze(0)  # [1, seq_len]
 
-    def _prefill(self, slot: messages_pb2.RequestSlot) -> messages_pb2.RequestOutput:
-        input_ids = self._to_gpu(list(slot.token_ids))
+    def _prefill_batch(self, slots: List[messages_pb2.RequestSlot]
+                       ) -> List[messages_pb2.RequestOutput]:
+        batch_size  = len(slots)
+        seq_lengths = [s.seq_length for s in slots]
+        max_len     = max(seq_lengths)
+
+        # left-pad so every sequence ends at position max_len-1
+        input_ids      = torch.zeros(batch_size, max_len, dtype=torch.long, device=self.device)
+        attention_mask = torch.zeros(batch_size, max_len, dtype=torch.long, device=self.device)
+        position_ids   = torch.zeros(batch_size, max_len, dtype=torch.long, device=self.device)
+
+        for i, s in enumerate(slots):
+            toks = list(s.token_ids)
+            slen = len(toks)
+            pad  = max_len - slen
+            input_ids[i,      pad:] = torch.tensor(toks, dtype=torch.long, device=self.device)
+            attention_mask[i, pad:] = 1
+            position_ids[i,   pad:] = torch.arange(slen, device=self.device)
+
         with torch.no_grad():
-            out = self.model(input_ids, use_cache=True)
+            out = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=True,
+            )
 
-        next_token_id = int(out.logits[0, -1, :].argmax())
-        self.kv_store.write_slot(slot.kv_slot_id, out.past_key_values,
-                                 slot.seq_length)
+        outputs = []
+        for i, s in enumerate(slots):
+            slen          = s.seq_length
+            next_token_id = int(out.logits[i, -1, :].argmax())
 
-        is_finished = (next_token_id == EOS_TOKEN_ID or slot.max_new_tokens <= 1)
-        print(f"[GPUWorker] prefill {slot.request_id} "
-              f"input_len={slot.seq_length} next_token={next_token_id}")
+            single_kv = _extract_kv_slice(out.past_key_values, i, max_len - slen, NUM_LAYERS)
+            self.kv_store.write_slot(s.kv_slot_id, single_kv, slen)
 
-        return messages_pb2.RequestOutput(
-            request_id=slot.request_id,
-            next_token_id=next_token_id,
-            is_finished=is_finished,
-        )
+            is_finished = (next_token_id == EOS_TOKEN_ID or s.max_new_tokens <= 1)
+            print(f"[GPUWorker] prefill {s.request_id} "
+                  f"input_len={slen} next_token={next_token_id}")
+
+            outputs.append(messages_pb2.RequestOutput(
+                request_id=s.request_id,
+                next_token_id=next_token_id,
+                is_finished=is_finished,
+            ))
+
+        return outputs
 
     def _decode_batch(self, slots: List[messages_pb2.RequestSlot]
                       ) -> List[messages_pb2.RequestOutput]:
@@ -129,11 +177,8 @@ class GPUWorker:
         # ── write updated KV back to slots ──────────────────────────────
         for i, s in enumerate(slots):
             new_seq_len = s.seq_length + 1
-            single_kv = tuple(
-                (out.past_key_values[l][0][i:i+1, :, max_seq - s.seq_length:, :],
-                 out.past_key_values[l][1][i:i+1, :, max_seq - s.seq_length:, :])
-                for l in range(NUM_LAYERS)
-            )
+            single_kv = _extract_kv_slice(out.past_key_values, i,
+                                          max_seq - s.seq_length, NUM_LAYERS)
             self.kv_store.write_slot(s.kv_slot_id, single_kv, new_seq_len)
 
         outputs = []
@@ -162,8 +207,8 @@ class GPUWorker:
         prefill_slots = [s for s in batch.slots if s.is_prefill]
         decode_slots  = [s for s in batch.slots if not s.is_prefill]
 
-        for slot in prefill_slots:
-            outputs.append(self._prefill(slot))
+        if prefill_slots:
+            outputs.extend(self._prefill_batch(prefill_slots))
 
         if decode_slots:
             outputs.extend(self._decode_batch(decode_slots))

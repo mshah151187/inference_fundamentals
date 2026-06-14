@@ -88,8 +88,13 @@ class Scheduler:
                   f"waiting={len(self.waiting)}")
 
     def _schedule(self):
+        # Limit new prefills per step so GPU activation memory stays bounded.
+        # Each prefill costs O(seq_len × d_model) activation memory vs O(1 × d_model)
+        # for decode. Admitting too many prefills at once spikes activation memory
+        # on top of the pre-allocated KV cache budget.
+        MAX_NEW_PER_STEP = 4
         promoted = []
-        while self.waiting:
+        while self.waiting and len(promoted) < MAX_NEW_PER_STEP:
             request = self.waiting[0]
             slot_id = self.block_pool.allocate(request.request_id)
             if slot_id is None:

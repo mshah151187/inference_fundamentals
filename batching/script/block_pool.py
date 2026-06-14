@@ -78,18 +78,23 @@ class KVStore:
         print(f"[KVStore] pre-allocated {mem_mb:.1f} MB on {device} "
               f"({max_slots} slots × {num_layers} layers × 2 × {max_seq_len} tokens)")
 
-    def write_slot(self, slot_id: int, past_key_values: tuple, seq_len: int):
+    def write_slot(self, slot_id: int, past_key_values, seq_len: int):
         """
         Write HuggingFace past_key_values into slot.
 
-        past_key_values: tuple of num_layers tuples, each (K, V)
-          K shape: [batch=1, num_heads, seq_len, head_dim]
-          V shape: [batch=1, num_heads, seq_len, head_dim]
+        Accepts either legacy tuple-of-tuples (transformers < 4.36) or DynamicCache
+        (transformers >= 4.36). DynamicCache exposes .key_cache / .value_cache lists.
 
-        We store as [num_layers, 2, seq_len, num_heads, head_dim]
-        transposed to match kv_store layout.
+        K shape per layer: [batch=1, num_heads, seq_len, head_dim]
+        Stored transposed:  [seq_len, num_heads, head_dim] to match kv_store layout.
         """
-        for layer_idx, (k, v) in enumerate(past_key_values):
+        use_cache_obj = hasattr(past_key_values, 'key_cache')
+        for layer_idx in range(self.num_layers):
+            if use_cache_obj:
+                k = past_key_values.key_cache[layer_idx]
+                v = past_key_values.value_cache[layer_idx]
+            else:
+                k, v = past_key_values[layer_idx]
             # k: [1, num_heads, seq_len, head_dim] → [seq_len, num_heads, head_dim]
             k = k.squeeze(0).permute(1, 0, 2).to(torch.float16)
             v = v.squeeze(0).permute(1, 0, 2).to(torch.float16)

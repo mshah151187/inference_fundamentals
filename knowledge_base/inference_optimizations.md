@@ -711,45 +711,6 @@ With PagedAttention — 16-token pages:
 
 ---
 
-#### Chunked Prefill — Reduce prefill_time impact and eliminate decode stalls
-
-**Root cause it fixes:** Without chunked prefill, when a request is admitted it runs
-its ENTIRE prefill in one decode iteration. A 500-token prompt may take 200ms of
-prefill — during that step, all 900 decode requests miss their 10ms ITL window,
-causing an ITL spike. The new request itself still had to wait in queue first.
-
-**How it works:** Split the prefill into small chunks (e.g. 128 tokens each). Each
-chunk is processed during an otherwise spare portion of a decode step. The request
-starts contributing useful compute work before it even holds a full KV slot.
-
-**Concrete example:**
-
-```
-500-token prompt, no chunked prefill:
-  Step N:   [900 decode requests]
-  ← request waits in queue →
-  Step N+k: slot frees → [1 full prefill = 500 tokens]   ← 200ms, decode stalls
-  Step N+k+1: first token returned
-  TTFT = queue_wait + 200ms full prefill
-
-500-token prompt, chunked prefill (chunk = 128 tokens):
-  Step N:   [900 decode] + [chunk 1/4 of new request — 128 tokens]  ← 10ms + 10ms
-  Step N+1: [900 decode] + [chunk 2/4 — 128 tokens]
-  Step N+2: [900 decode] + [chunk 3/4 — 128 tokens]
-  Step N+3: [900 decode] + [chunk 4/4 — 128 tokens] → first token!
-  TTFT = queue_wait + 4 × ~12ms = queue_wait + ~48ms
-
-Benefits:
-  1. TTFT drops: prefill work starts immediately using idle SM cycles, no
-     need to wait for a single step dedicated to full prefill.
-  2. ITL protected: no single step is hijacked by a 200ms prefill — each
-     step adds only a small chunk overhead, ITL stays near 10–12ms.
-  3. SM utilization improves: decode is GEMV (memory-bound, SMs underused).
-     Prefill chunks are GEMM (compute-bound). Interleaving fills idle SMs.
-```
-
----
-
 #### Disaggregated Prefill / Decode — Eliminate prefill-decode interference at cluster level
 
 **Root cause it fixes:** Prefill (GEMM, compute-bound) and decode (GEMV,
@@ -803,18 +764,281 @@ at scale where prefill-decode interference is measurable.
 **TTFT technique summary:**
 
 ```
-Technique            Attacks              Mechanism
-───────────────────  ───────────────────  ──────────────────────────────────────
-PagedAttention       queue_wait           Fit more requests per GPU by eliminating
-                                          KV fragmentation → queue drains faster
-Chunked Prefill      prefill_time + ITL   Start prefill early using idle SM cycles;
-                                          no single step hijacked by full prefill
-Disagg. P/D          both (cluster)       Dedicated GPU pools eliminate interference;
-                                          D-GPU never stalls for prefill
+Technique            Attacks         Mechanism
+───────────────────  ──────────────  ──────────────────────────────────────────
+PagedAttention       queue_wait      Fit more requests per GPU → queue drains faster
+Disagg. P/D          queue_wait      D-GPU never stalls for prefill → no queue backup
+                     + prefill_time  P-GPU runs dedicated prefill fast (cluster-level)
 ```
 - On a single GPU both pools collapse into one — no isolation possible
 
 Detailed docs: `kv_cache.md`, `PagedAttention.md`, `flash_attention.md`
+
+---
+
+### 4.4 ITL Optimization Techniques
+
+ITL = time per decode step. High ITL means tokens trickle out slowly — streaming
+feels choppy even if TTFT was fine.
+
+---
+
+#### Chunked Prefill — Protect existing requests from prefill-induced ITL spikes
+
+**Root cause it fixes:** When a new request is admitted, its full prefill runs in
+one dedicated step. A 500-token prefill takes ~200ms. Every decode request in the
+running batch misses its 10ms ITL window for that step — a visible stall in their
+token stream.
+
+Chunked prefill does NOT reduce the new request's TTFT. Total prefill compute is
+the same regardless of how it is chunked. What changes is how that compute is
+distributed across steps — protecting existing requests' ITL.
+
+**How it works:** Split prefill into small chunks (e.g. 128 tokens each) and
+process one chunk per decode step alongside the existing decode batch. No single
+step is monopolized by a full prefill.
+
+**Concrete example:**
+
+```
+500-token prefill, no chunked prefill:
+  Step N:   [900 decode]              10ms  ← normal ITL
+  Step N+1: [1 full prefill]         200ms  ← 900 requests stall, ITL = 200ms
+  Step N+2: [901 decode]              10ms  ← back to normal
+  New request TTFT = queue_wait + 200ms
+
+500-token prefill, chunked prefill (128 tokens per chunk):
+  128 tokens = 200ms × (128/500) ≈ 51ms per chunk
+
+  Step N:   [900 decode + chunk 1/4]   ~51ms  ← ITL bump, not spike
+  Step N+1: [900 decode + chunk 2/4]   ~51ms
+  Step N+2: [900 decode + chunk 3/4]   ~51ms
+  Step N+3: [900 decode + chunk 4/4]   ~51ms → first token for new request
+  New request TTFT = queue_wait + 4 × 51ms = queue_wait + 204ms  ← same as before
+
+Without chunked prefill: ITL p99 = 200ms (one big spike every new admission)
+With chunked prefill:    ITL p99 = 51ms  (smaller bumps, distributed)
+
+TTFT for the new request is unchanged.
+The 900 existing requests are what benefit — their worst-case ITL drops 4×.
+```
+
+**Why total prefill time stays the same:**
+128-token chunk takes 51ms ≠ "free." Prefill is compute-bound (GEMM). Decode is
+memory-bandwidth-bound (GEMV). On a single GPU they share SMs — a chunk of 128
+prefill tokens costs 51ms of SM time whether chunked or not. You are just
+spreading that 200ms cost across 4 steps of 51ms instead of 1 step of 200ms.
+
+**ITL technique summary:**
+
+```
+Technique        Attacks    Mechanism
+───────────────  ─────────  ────────────────────────────────────────────────
+Chunked Prefill  ITL p99    Spread prefill cost across steps → no single
+                            step monopolized → worst-case ITL drops
+GQA / MQA        ITL avg    Fewer KV heads → less HBM read per decode step
+                            → each step faster → lower average ITL
+Speculative dec  ITL avg    Draft model generates k tokens, large model
+                            verifies all k in one step → effective ITL / k
+```
+
+---
+
+### 4.5 Memory Management in LLM Serving
+
+**The core tension:** KV cache allocation and prefill activation memory compete for the
+same HBM. The scheduler is what enforces the tradeoff.
+
+---
+
+#### Two types of GPU memory
+
+```
+Model weights       — fixed, loaded once at startup (~500 MB for GPT-2, ~14 GB for 7B)
+
+KV cache            — persistent, pre-allocated at startup, grows with concurrent requests
+                      lives in HBM between decode steps
+                      per slot = seq_len × layers × 2 × heads × head_dim × dtype
+                      GPT-2: 1024 × 12 × 2 × 12 × 64 × 2 bytes = 36 MB per slot
+                      910 slots = 32 GB  (our A100 40GB budget)
+
+Activation memory   — temporary, allocated during forward pass, freed immediately after
+                      spikes during prefill, tiny during decode
+```
+
+---
+
+#### Why prefill and decode have completely different activation footprints
+
+**Prefill** — all input tokens processed at once. Each request contributes `seq_len` tokens:
+
+```
+GPT-2 small, batch=910 requests, seq=430 tokens each:
+
+  Q, K, V projections:  [910, 430, 768]  × 3  =  3.6 GB
+  Attention score matrix: [910, 12, 430, 430]  =  9.6 GB   ← O(batch × seq²)
+  MLP hidden layer:    [910, 430, 3072]       =  14.4 GB
+  ─────────────────────────────────────────────────────────
+  Total activation peak:                       ~ 18 GB
+```
+
+**Decode** — one new query token per request per step. Each request contributes 1 token:
+
+```
+GPT-2 small, batch=910 requests, 1 new token each:
+
+  Q, K, V projections:  [910, 1, 768]  × 3  =   2 MB
+  Attention scores:     [910, 12, 1, 430]   =   23 MB   ← O(batch × 1 × seq)
+  MLP hidden layer:    [910, 1, 3072]       =   11 MB
+  ─────────────────────────────────────────────────────────
+  Total activation peak:                       ~ 36 MB   ← negligible
+```
+
+The difference: **prefill is O(seq) in activation memory per token**, decode is O(1) per token.
+KV cache is read from HBM but was already allocated — no new allocation per decode step.
+
+---
+
+#### The burst scenario
+
+This problem surfaces under extreme load — when many requests arrive simultaneously,
+fill all KV slots, and all need prefill at once:
+
+```
+180 QPS, 910 KV slots, no prefill admission control:
+
+  t=0s:    requests arrive → slots fill in 5s → 910 requests all in WAITING
+  t=5s:    scheduler promotes all 910 to RUNNING in one _schedule() call
+  t=5s:    GPU Worker receives batch with 910 prefill slots
+  t=5s:    GPU attempts 910 × seq=430 token prefill:
+
+    KV cache (already allocated): 32 GB
+    Activation memory needed:     18 GB
+    Model weights:                 2 GB
+    ──────────────────────────────────
+    Total:                        52 GB  → OOM on A100 40GB
+```
+
+Even without OOM, processing 910 prefills sequentially (one forward pass each):
+```
+910 requests × 300ms per prefill = 4.5 hours for one batch step
+```
+Scheduler blocks waiting for result → Tokenizer's ZMQ buffer fills → backpressure
+cascades up the entire pipeline.
+
+---
+
+#### FlashAttention's role
+
+FlashAttention tiles the Q×K^T computation into SRAM blocks — the full attention
+score matrix is never materialized in HBM:
+
+```
+Standard attention:   [910, 12, 430, 430] × 4 bytes = 9.6 GB   ← peak HBM spike
+FlashAttention:       [910, 12, 64, 430]  × 4 bytes = 1.1 GB   ← per tile, reused
+                      (tile size = 64, reused across tiles, not accumulated)
+```
+
+FlashAttention reduces activation from O(seq²) to O(seq × tile_size). But it does not
+touch Q/K/V projections or MLP activations, which remain O(batch × seq × d_model).
+After FlashAttention:
+
+```
+With FlashAttention, batch=910 prefills:
+  Q, K, V:        3.6 GB  (unchanged)
+  Attention:     ~0 GB    (tiled, never materialized)
+  MLP:           14.4 GB  (unchanged)
+  KV cache:      32 GB    (unchanged)
+  ──────────────────────────────────
+  Total:         ~50 GB   → still OOM on A100 40GB
+```
+
+FlashAttention helps significantly (eliminates 9.6 GB spike) but does not make
+arbitrarily large prefill batches free. MLP activations dominate at large batch sizes.
+
+---
+
+#### Scheduling as the memory enforcer
+
+Since you cannot batch all N prefills at once, the scheduler must limit how many
+prefills enter each step. Two mechanisms:
+
+**MAX_NEW_PER_STEP** — limit requests admitted per step:
+
+```python
+MAX_NEW_PER_STEP = 1   # at most 1 new prefill per decode step
+
+def _schedule(self):
+    promoted = []
+    while self.waiting and len(promoted) < MAX_NEW_PER_STEP:
+        slot_id = self.block_pool.allocate(request.request_id)
+        if slot_id is None:
+            break
+        ...
+        promoted.append(request.request_id)
+```
+
+Effect on each step:
+```
+Step with MAX_NEW_PER_STEP=1:
+  1 prefill  × 430 tokens → activation: 4 MB    ← tiny
+  909 decodes × 1 token   → activation: 36 MB   ← tiny
+  Total: 40 MB on top of 32 GB KV → fits comfortably
+
+  GPU step time: ~300ms prefill + ~10ms decode = ~310ms
+  Scheduler unblocks every 310ms → pipeline stays alive
+```
+
+Requests ramp up one per step. Steady state (all 910 slots decoding) is reached
+slowly, but no OOM and no pipeline stall.
+
+**Chunked prefill** — limit tokens per step instead of requests:
+
+Rather than blocking a full 430-token prefill in one step, break it into 128-token
+chunks spread across 4 steps. Finer control over per-step activation budget:
+
+```
+Activation per chunk step: 1 request × 128 tokens × d_model = 1.2 MB  ← even smaller
+vs full prefill step:       1 request × 430 tokens × d_model = 4 MB
+```
+
+Chunked prefill also protects decode ITL: a 128-token chunk costs ~51ms vs 200ms
+for a full 430-token prefill — less disruption to the ongoing decode batch.
+
+**vLLM's approach — dynamic admission control:**
+
+Rather than a fixed N, vLLM measures remaining HBM before every step:
+
+```python
+# conceptual — not vLLM source
+remaining_hbm = total_hbm - kv_allocated - weights
+activation_budget = remaining_hbm * SAFETY_FACTOR
+tokens_this_step  = activation_budget / activation_per_token
+# admit prefill chunks up to tokens_this_step
+```
+
+As KV fills up (more concurrent requests), remaining HBM shrinks, fewer prefill
+tokens are admitted per step automatically.
+
+---
+
+#### The unified mental model
+
+```
+More KV slots allocated (more concurrent requests)
+  → less HBM headroom for activation memory
+    → must limit prefill tokens per step
+      → scheduler admission control enforces this
+        → MAX_NEW_PER_STEP or chunked prefill are the levers
+
+Decode at steady state (all slots occupied) is fine:
+  activation is O(batch × 1 × d_model) — negligible regardless of slot count.
+  The constraint is exclusively during prefill steps.
+```
+
+This is why KV cache sizing and scheduling policy are inseparable.
+You cannot set `max_slots` without also setting the prefill admission policy —
+otherwise a burst fills all slots and the first batch step OOMs or stalls for hours.
 
 ---
 
