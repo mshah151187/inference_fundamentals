@@ -8,7 +8,7 @@ echo "=== Installing Python packages ==="
 
 # core ML
 pip install --upgrade Pillow
-pip install transformers accelerate
+pip install "transformers==4.44.0" accelerate
 
 # ZMQ — inter-process communication between pipeline stages
 pip install pyzmq
