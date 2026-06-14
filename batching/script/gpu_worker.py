@@ -33,16 +33,25 @@ EOS_TOKEN_ID = 50256
 def _extract_kv_slice(past_key_values, batch_idx: int, seq_start: int,
                       num_layers: int) -> tuple:
     """Extract KV for one request from a batched past_key_values.
-    Handles both DynamicCache (transformers >= 4.36) and legacy tuple-of-tuples.
-    Returns a legacy tuple of (k, v) pairs, one per layer.
-      k shape: [1, num_heads, seq_len, head_dim]
+    Normalizes all Cache formats to legacy tuple-of-tuples before slicing.
+      k shape returned: [1, num_heads, seq_len, head_dim]
     """
-    if hasattr(past_key_values, 'key_cache'):
-        return tuple(
-            (past_key_values.key_cache[l][batch_idx:batch_idx+1, :, seq_start:, :],
-             past_key_values.value_cache[l][batch_idx:batch_idx+1, :, seq_start:, :])
+    # Normalize to legacy tuple-of-tuples. Try most universal path first.
+    if hasattr(past_key_values, 'to_legacy_cache'):
+        past_key_values = past_key_values.to_legacy_cache()
+    elif hasattr(past_key_values, 'key_cache'):
+        past_key_values = tuple(
+            (past_key_values.key_cache[l], past_key_values.value_cache[l])
             for l in range(num_layers)
         )
+    else:
+        # Unknown format — print diagnostics before crashing
+        item0 = past_key_values[0] if hasattr(past_key_values, '__getitem__') else None
+        print(f"[DEBUG] past_key_values type={type(past_key_values).__name__} "
+              f"len={len(past_key_values) if hasattr(past_key_values, '__len__') else 'N/A'} "
+              f"item[0] type={type(item0).__name__} "
+              f"shape={getattr(item0, 'shape', 'N/A')}")
+
     return tuple(
         (past_key_values[l][0][batch_idx:batch_idx+1, :, seq_start:, :],
          past_key_values[l][1][batch_idx:batch_idx+1, :, seq_start:, :])
