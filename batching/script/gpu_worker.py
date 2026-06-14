@@ -45,12 +45,9 @@ def _extract_kv_slice(past_key_values, batch_idx: int, seq_start: int,
             for l in range(num_layers)
         )
     else:
-        # Unknown format — print diagnostics before crashing
-        item0 = past_key_values[0] if hasattr(past_key_values, '__getitem__') else None
-        print(f"[DEBUG] past_key_values type={type(past_key_values).__name__} "
-              f"len={len(past_key_values) if hasattr(past_key_values, '__len__') else 'N/A'} "
-              f"item[0] type={type(item0).__name__} "
-              f"shape={getattr(item0, 'shape', 'N/A')}")
+        # Unknown format — dump all instance attributes for diagnosis
+        print(f"[DEBUG] past_key_values type={type(past_key_values).__name__}")
+        print(f"[DEBUG] instance attrs: {list(vars(past_key_values).keys())}")
 
     return tuple(
         (past_key_values[l][0][batch_idx:batch_idx+1, :, seq_start:, :],
