@@ -110,7 +110,7 @@ class KVStore:
         past_key_values = []
         for layer_idx in range(self.num_layers):
             # [seq_len, num_heads, head_dim] → [1, num_heads, seq_len, head_dim]
-            k = self.kv_store[slot_id, layer_idx, 0, :seq_len].permute(1, 0, 2).unsqueeze(0)
-            v = self.kv_store[slot_id, layer_idx, 1, :seq_len].permute(1, 0, 2).unsqueeze(0)
+            k = self.kv_store[slot_id, layer_idx, 0, :seq_len].permute(1, 0, 2).unsqueeze(0).float()
+            v = self.kv_store[slot_id, layer_idx, 1, :seq_len].permute(1, 0, 2).unsqueeze(0).float()
             past_key_values.append((k, v))
         return tuple(past_key_values)

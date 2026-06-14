@@ -58,7 +58,7 @@ class GPUWorker:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"[GPUWorker] loading GPT-2 on {self.device}...")
-        self.model = GPT2LMHeadModel.from_pretrained("gpt2").to(self.device).half().eval()
+        self.model = GPT2LMHeadModel.from_pretrained("gpt2").to(self.device).eval()
 
         self.kv_store = KVStore(
             max_slots=MAX_SLOTS,
@@ -144,9 +144,9 @@ class GPUWorker:
         padded_kvs = []
         for layer_idx in range(NUM_LAYERS):
             k_batch = torch.zeros(batch_size, NUM_KV_HEADS, max_seq, HEAD_DIM,
-                                  device=self.device, dtype=torch.float16)
+                                  device=self.device)
             v_batch = torch.zeros(batch_size, NUM_KV_HEADS, max_seq, HEAD_DIM,
-                                  device=self.device, dtype=torch.float16)
+                                  device=self.device)
             for i, s in enumerate(slots):
                 kv = self.kv_store.read_slot(s.kv_slot_id, s.seq_length)
                 k_i, v_i = kv[layer_idx]
