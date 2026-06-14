@@ -57,8 +57,8 @@ class KVStore:
 
     For GPT-2 small (num_layers=12, num_kv_heads=12, head_dim=64, FP16=2 bytes):
       per slot = 1024 × 12 × 2 × 12 × 64 × 2 = 36 MB
-      910 slots = 910 × 36 MB = 32 GB  (target KV budget on A100 40GB)
-      remaining 8 GB: model weights (~500 MB) + CUDA overhead (~1 GB) + safety buffer
+      256 slots = 256 × 36 MB = 9.2 GB  (conservative KV budget)
+      remaining 28 GB: model weights (fp16 ~250 MB) + decode activations + safety buffer
     """
 
     def __init__(self, max_slots: int, num_layers: int, max_seq_len: int,
@@ -110,7 +110,7 @@ class KVStore:
         past_key_values = []
         for layer_idx in range(self.num_layers):
             # [seq_len, num_heads, head_dim] → [1, num_heads, seq_len, head_dim]
-            k = self.kv_store[slot_id, layer_idx, 0, :seq_len].permute(1, 0, 2).unsqueeze(0).float()
-            v = self.kv_store[slot_id, layer_idx, 1, :seq_len].permute(1, 0, 2).unsqueeze(0).float()
+            k = self.kv_store[slot_id, layer_idx, 0, :seq_len].permute(1, 0, 2).unsqueeze(0)
+            v = self.kv_store[slot_id, layer_idx, 1, :seq_len].permute(1, 0, 2).unsqueeze(0)
             past_key_values.append((k, v))
         return tuple(past_key_values)

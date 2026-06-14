@@ -22,7 +22,7 @@ import messages_pb2
 DISPATCH_ADDR = "ipc:///tmp/sched_to_gpu.ipc"
 RESULT_ADDR   = "ipc:///tmp/gpu_to_sched.ipc"
 
-MAX_SLOTS    = 910   # 910 × 36 MB = 32 GB KV cache on A100 40GB
+MAX_SLOTS    = 256   # 256 × 36 MB = 9.2 GB; leaves ~28 GB for activations + weights
 MAX_SEQ_LEN  = 1024
 NUM_LAYERS   = 12
 NUM_KV_HEADS = 12
@@ -58,7 +58,7 @@ class GPUWorker:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"[GPUWorker] loading GPT-2 on {self.device}...")
-        self.model = GPT2LMHeadModel.from_pretrained("gpt2").to(self.device).eval()
+        self.model = GPT2LMHeadModel.from_pretrained("gpt2").to(self.device).half().eval()
 
         self.kv_store = KVStore(
             max_slots=MAX_SLOTS,
@@ -144,9 +144,9 @@ class GPUWorker:
         padded_kvs = []
         for layer_idx in range(NUM_LAYERS):
             k_batch = torch.zeros(batch_size, NUM_KV_HEADS, max_seq, HEAD_DIM,
-                                  device=self.device)
+                                  device=self.device, dtype=torch.float16)
             v_batch = torch.zeros(batch_size, NUM_KV_HEADS, max_seq, HEAD_DIM,
-                                  device=self.device)
+                                  device=self.device, dtype=torch.float16)
             for i, s in enumerate(slots):
                 kv = self.kv_store.read_slot(s.kv_slot_id, s.seq_length)
                 k_i, v_i = kv[layer_idx]

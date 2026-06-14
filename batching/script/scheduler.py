@@ -27,7 +27,7 @@ IN_ADDR       = "ipc:///tmp/tok_to_sched.ipc"
 DISPATCH_ADDR = "ipc:///tmp/sched_to_gpu.ipc"
 RESULT_ADDR   = "ipc:///tmp/gpu_to_sched.ipc"
 
-MAX_SLOTS = 910   # 910 × 36 MB = 32 GB KV cache on A100 40GB
+MAX_SLOTS = 256   # 256 × 36 MB = 9.2 GB; leaves ~28 GB for activations + weights
 
 
 class Scheduler:
