@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+// ─── Request lifecycle ────────────────────────────────────────────────────────
+//
+// A Request travels through the pipeline as follows:
+//
+//   Generator creates RawRequest
+//       ↓  [ZMQ: gen → tok]
+//   Tokenizer fills token_ids → produces TokenizedRequest
+//       ↓  [ZMQ: tok → sched]
+//   Scheduler promotes to running → produces BatchMetadata
+//       ↓  [ZMQ: sched → gpu]
+//   GPU Worker executes → produces BatchOutput
+//       ↓  [ZMQ: gpu → sched]
+//   Scheduler updates state, logs metrics
+//
+// Each message type captures exactly the data that crosses one process boundary.
+// No field is carried further than it needs to be.
+
+// ─── Generator → Tokenizer ───────────────────────────────────────────────────
+
+message RawRequest {
+  string request_id    = 1;   // unique ID, e.g. "req_0042"
+  string prompt        = 2;   // raw text, not yet tokenized
+  int32  max_new_tokens = 3;  // how many tokens to generate
+  double arrival_time  = 4;   // unix timestamp, set by generator
+}
+
+// ─── Tokenizer → Scheduler ───────────────────────────────────────────────────
+
+message TokenizedRequest {
+  string         request_id      = 1;
+  string         prompt          = 2;   // carried for logging/debugging
+  int32          max_new_tokens  = 3;
+  double         arrival_time    = 4;
+  repeated int32 token_ids       = 5;   // output of tokenizer
+  int32          num_input_tokens = 6;  // len(token_ids), for convenience
+}
+
+// ─── Scheduler → GPU Worker ──────────────────────────────────────────────────
+//
+// A single step's batch. Contains one entry per running request.
+// Prefill and decode requests are mixed — GPU Worker separates them.
+
+message RequestSlot {
+  string         request_id          = 1;
+  repeated int32 token_ids           = 2;   // full prompt tokens (prefill)
+                                             // or last generated token (decode)
+  int32          kv_slot_id          = 3;   // index into KVStore on GPU Worker
+  int32          seq_length          = 4;   // kv_seq_len: actual entries in KV store
+  bool           is_prefill          = 5;   // true on first step, false for decode steps
+  int32          max_new_tokens      = 6;
+  int32          num_generated_tokens = 7;  // tokens generated so far (0 during prefill)
+                                             // finish when num_generated_tokens + 1 >= max_new_tokens
+}
+
+message BatchMetadata {
+  repeated RequestSlot slots = 1;   // one entry per running request
+}
+
+// ─── GPU Worker → Scheduler ──────────────────────────────────────────────────
+
+message RequestOutput {
+  string request_id    = 1;
+  int32  next_token_id = 2;   // argmax of logits for this request
+  bool   is_finished   = 3;   // hit EOS or max_new_tokens
+}
+
+message BatchOutput {
+  repeated RequestOutput outputs = 1;
+}
