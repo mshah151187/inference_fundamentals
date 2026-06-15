@@ -600,6 +600,98 @@ INT4 requires careful calibration. Negligible for INT8 on most models.
 
 ---
 
+### 3.8 Producer-Side Batching for Backpressure Resilience
+
+**What it does:** Coalesce multiple requests into a single message at the producer
+before sending downstream, rather than emitting one message per request.
+
+**Which goal:** Goal 2 — pipeline parallelism. Reduces the number of messages in
+flight between stages, which directly improves resilience when a downstream stage
+is slow.
+
+**Why message count matters — ZMQ HWM:**
+
+ZMQ (and most message queue systems — Kafka, RabbitMQ) enforce backpressure via
+a High Water Mark (HWM) counted in **messages, not bytes**. When the downstream
+consumer is slow, the upstream buffer fills up message by message. Once HWM is
+reached, the producer's `send()` blocks.
+
+```
+ZMQ default HWM = 1000 messages
+
+Single-request messages:  1000 messages × 1 request  = 1000 requests buffered
+Batched messages (N=16):  1000 messages × 16 requests = 16,000 requests buffered
+```
+
+Batching at the producer multiplies the effective buffer capacity by N — the same
+number of ZMQ messages now absorbs N× more requests before backpressure kicks in.
+
+**What this does and does not fix:**
+
+Batching delays backpressure — it does not eliminate it. If the downstream stage
+is fundamentally slow (e.g. GPU Worker blocked on a long batch), the queue will
+eventually fill regardless of message size. The root fix is keeping downstream step
+time bounded. Producer batching is a complementary resilience layer that absorbs
+short bursts without propagating stalls upstream.
+
+```
+Downstream slow for 5s, upstream emits at 180 QPS:
+
+Without batching (N=1):  180 × 5 = 900 messages → hits HWM=1000 in ~5.5s → stall
+With batching (N=16):    900/16 = 57 messages  → far from HWM=1000 → no stall
+
+Downstream slow for 60s:
+Without batching:  180 × 60 = 10,800 → stall at ~5.5s
+With batching:     10,800/16 = 675  → stall at ~88s  ← longer grace period
+```
+
+**Throughput bonus — batch tokenization:**
+
+Tokenizers (HuggingFace, SentencePiece) have vectorized batch mode that is
+significantly faster than tokenizing one string at a time:
+
+```python
+# Single (current):
+for request in requests:
+    tokens = tokenizer(request.prompt)   # Python loop, no parallelism
+
+# Batched:
+batch_tokens = tokenizer(
+    [r.prompt for r in requests],
+    padding=True, truncation=True
+)                                        # vectorized C++ kernel, 5-10× faster
+```
+
+The same CPU call tokenizes N requests in roughly the time of 1. This frees the
+tokenizer stage to keep up with higher QPS without becoming a bottleneck.
+
+**Where it applies:**
+
+Any pipeline stage where the producer is faster than the consumer and the queue
+is message-count bounded. Not limited to ML inference:
+
+```
+LLM pipeline:     Generator → Tokenizer batch → Scheduler
+Video pipeline:   Frame reader → Feature extractor batch → Embedding model
+Kafka pipeline:   Event producer → batch → Consumer group
+```
+
+**Tradeoffs:**
+
+```
+Pro:  N× more buffer before backpressure
+Pro:  Batch processing at consumer is more efficient (one recv() per N requests)
+Pro:  Tokenizer throughput improves via vectorized batch mode
+Con:  Adds micro-batching latency — producer waits to fill a batch before sending
+      (mitigated by a timeout: send when batch full OR after T ms, whichever first)
+Con:  Larger individual messages — if one message is dropped, N requests are lost
+```
+
+**Metric improved:** Resilience under burst load ↑, Throughput ↑, Latency ↑ (slight,
+due to batching wait)
+
+---
+
 ## 4. LLM-Specific Optimizations
 
 These apply specifically to autoregressive transformer inference.
@@ -1039,6 +1131,135 @@ Decode at steady state (all slots occupied) is fine:
 This is why KV cache sizing and scheduling policy are inseparable.
 You cannot set `max_slots` without also setting the prefill admission policy —
 otherwise a burst fills all slots and the first batch step OOMs or stalls for hours.
+
+---
+
+### 4.6 Knowing Your Workload: How Real Production Systems Handle Limits
+
+**The core insight:** Your KV slot capacity is directly determined by your expected
+maximum sequence length. The formula is fixed:
+
+```
+KV slots = HBM_budget / (max_seq_len × per_token_KV_cost)
+
+GPT-2 small example:
+  32 GB HBM / (1024 tokens × 36 KB/token) = 910 slots    ← our experiment
+  32 GB HBM /  (512 tokens × 36 KB/token) = 1820 slots   ← 2× more concurrency
+  32 GB HBM /  (256 tokens × 36 KB/token) = 3641 slots   ← 4× more concurrency
+```
+
+Halving your max sequence length doubles the number of concurrent users you can
+serve from the same hardware — without any code change. This is why workload
+knowledge is a first-class infrastructure decision.
+
+---
+
+#### What we learned from our pipeline experiment
+
+We set `max_new_tokens=500` with prompts of ~450 tokens. Max seq grew to ~950.
+As seq grew past 736, the float32 padded KV tensors in `_decode_batch` exhausted
+remaining HBM and OOMed:
+
+```
+KV store (256 slots × 36 MB):            9.2 GB  (fixed)
+Decode activation (float32, batch=256):
+  24 × [256, 12, 736, 64] × 4 bytes  =  13.3 GB  (grows with seq)
+──────────────────────────────────────────────────────────
+Total:                                   38.8 GB  → OOM at 39.5 GB A100
+```
+
+The fix: cap `max_new_tokens=150`, total seq stays under ~510. Activation stays
+under 9 GB. Pipeline runs to completion without OOM.
+
+**The lesson:** knowing that your workload has p99 output length = 150 tokens lets
+you set a hard cap that prevents the system from running into a class of memory
+problems at all — before the GPU ever sees the request.
+
+---
+
+#### How every major production system handles this
+
+| System | Input cap | Output cap | Where enforced |
+|---|---|---|---|
+| OpenAI GPT-4o | 128K context window | `max_tokens` param (required) | API gateway |
+| Anthropic Claude | 200K context window | `max_tokens` param (required) | API gateway |
+| vLLM deployment | `--max-model-len` flag | `--max-new-tokens` flag | Startup config |
+| TGI (HuggingFace) | `--max-input-length` | `--max-new-tokens` | Startup config |
+
+**Key pattern:** these caps are enforced at the API gateway or startup config —
+requests that exceed the limit are rejected with HTTP 400 before touching the GPU.
+The GPU never sees an oversized request.
+
+---
+
+#### What "knowing your workload" means operationally
+
+Before setting any of these limits, production teams profile their traffic:
+
+```
+Workload analysis questions:
+  What is p50 / p99 input token length?
+  What is p50 / p99 output token length?
+  What is peak QPS? What is bursty vs steady?
+  What is avg request lifetime?
+
+These drive the capacity sizing formula:
+  concurrent_requests = QPS × avg_request_lifetime       ← Little's Law
+  KV_budget           = concurrent_requests × KV_per_request
+  max_seq_len         = p99_input + p99_output + safety_margin
+  MAX_SLOTS           = KV_budget / (max_seq_len × per_token_cost)
+```
+
+A chatbot workload (short prompts, short replies) and a document summarization
+workload (long prompts, medium replies) need completely different hardware configurations
+and slot counts — even on the same model.
+
+---
+
+#### Hard reject vs soft cap
+
+Two strategies for handling requests that exceed limits:
+
+**Hard reject (stateless, simple):**
+```
+Request arrives with input_tokens=600, max_new_tokens=300 → total=900
+Server checks: 900 > max_seq_len=512 → return HTTP 400 immediately
+GPU never involved. Latency = 1ms (pure API layer check).
+```
+
+**Soft cap / truncation (user-transparent, dangerous):**
+```
+Request arrives with 600 tokens → silently truncate to 512
+Risk: model loses context from truncated portion
+      user gets wrong answer without knowing why
+```
+
+Production systems almost always prefer hard reject over silent truncation.
+Failing loudly is easier to debug than wrong answers.
+
+---
+
+#### Why this matters more at larger scale
+
+For GPT-2 small (117M params), the numbers are modest. For production models:
+
+```
+Llama-3 70B in FP16:
+  Weights: 140 GB  (requires 2× A100 80GB just for weights)
+  KV per slot at seq=4096: 4096 × 80 layers × 2 × 8 heads × 128 dim × 2 bytes = 671 MB
+
+  Available for KV on 2× A100 (160 GB total):
+    160 GB - 140 GB weights = 20 GB for KV
+    20 GB / 671 MB per slot = 29 slots
+
+  With p99 output = 512 tokens instead of 4096:
+    KV per slot at seq=512+prompt: ~84 MB
+    20 GB / 84 MB = 238 slots ← 8× more concurrency, same hardware
+```
+
+Knowing that your users rarely need 4096-token outputs and capping at 512 gives
+you 8× more concurrent capacity at no cost. This is the most direct lever an
+infra team has before reaching for more GPUs.
 
 ---
 

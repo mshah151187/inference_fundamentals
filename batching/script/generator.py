@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'generated'))
 import messages_pb2
 
 EMIT_INTERVAL  = 1 / 180   # 180 QPS → one request every ~5.6ms
-MAX_NEW_TOKENS = 500
+MAX_NEW_TOKENS = 150
 ZMQ_ADDR = "ipc:///tmp/gen_to_tok.ipc"
 
 SENTENCE_POOL = [
@@ -37,9 +37,9 @@ SENTENCE_POOL = [
 ]
 
 
-def random_prompt(min_sentences: int = 35, max_sentences: int = 40) -> str:
-    # 35-40 sentences × ~12 tokens each ≈ 420-480 tokens prompt
-    # + 500 max_new_tokens → max total ~980 tokens, within max_seq_len=1024
+def random_prompt(min_sentences: int = 27, max_sentences: int = 30) -> str:
+    # 27-30 sentences × ~12 tokens each ≈ 324-360 tokens prompt
+    # + 150 max_new_tokens → max total ~510 tokens, well within max_seq_len=1024
     n = random.randint(min_sentences, max_sentences)
     return " ".join(random.choices(SENTENCE_POOL, k=n))
 
