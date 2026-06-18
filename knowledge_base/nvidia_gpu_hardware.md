@@ -129,7 +129,62 @@ per thread      shared by SM     shared by GPU    off-chip DRAM
 - On-chip, shared within an SM
 - ~96 KB per SM on A100 — tiny but ~10× faster than HBM
 - The key resource FlashAttention exploits: tiles Q, K, V into SRAM so the NxN attention matrix never goes to HBM
-- Also called L1 cache (configurable split between L1 and shared memory)
+- L1 cache and shared memory are TWO separate pools carved from the same physical SRAM
+  - L1 cache:      hardware-managed, automatic caching of HBM reads, no programmer control
+  - Shared memory: programmer-managed (__shared__), explicit thread-to-thread communication
+  - The split between them is configurable (e.g. 32KB L1 + 64KB shared on A100)
+  - They are NOT the same thing — same physical chip, different purposes
+
+### L2 Cache
+- On-chip, **shared across all SMs** on the GPU (unlike L1 which is per-SM)
+- 40 MB on A100, 50 MB on H100
+- Hardware-managed — no programmer control, same as L1
+- Sits between L1 and HBM in the hierarchy:
+
+```
+SM 0 reads address X → miss L1 → miss L2 → fetch from HBM → populate L2 → populate L1
+SM 1 reads address X → miss L1 → HIT L2  → return data (no HBM trip needed)
+```
+
+- Bandwidth: ~5 TB/s (between L1's ~10 TB/s and HBM's ~1.6 TB/s)
+- Useful when multiple SMs read overlapping data — transformer weight matrices are
+  a good example: many SMs read the same weights, L2 serves repeated reads cheaply
+- Weight quantization helps here too: smaller weights → more fit in L2 → fewer HBM trips
+
+### Cache Line
+The minimum unit of data the memory system transfers — the hardware never loads a
+single byte or float in isolation. It always loads a fixed-size chunk:
+
+```
+Cache line size on A100: 128 bytes
+                         = 32 floats  (FP32, 4 bytes each)
+                         = 64 halves  (FP16, 2 bytes each)
+```
+
+Even if a thread needs only 4 bytes (one float), the hardware loads the full 128-byte
+cache line containing that float and places the whole thing in L1/L2.
+
+**Why this matters — coalesced vs non-coalesced access:**
+
+```
+Warp of 32 threads reading consecutive floats (coalesced):
+  Thread 0:  address 0   ┐
+  Thread 1:  address 4   ├── 32 × 4 = 128 bytes = exactly 1 cache line
+  ...                    │
+  Thread 31: address 124 ┘
+  → 1 cache line load from HBM ✓
+
+Warp of 32 threads reading stride-128 floats (non-coalesced):
+  Thread 0:  address 0          → cache line 0
+  Thread 1:  address 128        → cache line 1
+  Thread 2:  address 256        → cache line 2
+  ...
+  → 32 separate cache line loads from HBM ✗
+  → 32× more bytes transferred for the same 32 floats
+```
+
+Non-coalesced access shows up in NCU as measured bytes >> theoretical bytes,
+making Arithmetic Intensity appear lower than it should be.
 
 ### HBM (High Bandwidth Memory)
 - The "GPU RAM" — where model weights, activations, and KV cache live

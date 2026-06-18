@@ -19,11 +19,12 @@
 | [knowledge_base/profiler.md](knowledge_base/profiler.md) | Overview of all profiling tools (Kineto, Nsight, HTA, Perfetto) |
 | [tensor_pin_memory/script/pinned_memory_transfer.py](tensor_pin_memory/script/pinned_memory_transfer.py) | Pageable vs pinned memory transfer deep dive |
 | *(coming)* | Phase 2 — batching (naive → bucketed → dynamic) |
-| *(coming)* | Phase 3 — warm-up + torch.compile |
-| *(coming)* | Phase 4 — KV cache implementation |
-| *(coming)* | Phase 5 — quantization (INT8, INT4, FP8, KV cache) |
-| *(coming)* | Phase 6 — Nsight Systems + Nsight Compute deep dive |
-| *(coming)* | Phase 7 — FastAPI server + Kubernetes deployment |
+| *(coming)* | Phase 3 — multiprocess serving (FastAPI + SO_REUSEPORT + process-per-GPU) |
+| *(coming)* | Phase 4 — warm-up + torch.compile + CUDA graphs |
+| *(coming)* | Phase 5 — KV cache implementation |
+| *(coming)* | Phase 6 — quantization (INT8, INT4, FP8, KV cache) |
+| *(coming)* | Phase 7 — Nsight Systems + Nsight Compute deep dive |
+| *(coming)* | Phase 8 — Kubernetes deployment + piecewise CUDA graphs |
 
 ---
 
@@ -63,9 +64,96 @@ Key insight: bucketing and dynamic batching solve different problems.
 - Dynamic batching controls **batch size** → GPU utilization, latency vs throughput tradeoff.
 - Production uses both together.
 
+**CUDA Graph prerequisite exercise (Step 2):**
+After implementing bucketed batching, observe that each bucket now produces a fixed
+`(batch_size, seq_len)` shape on every call. Verify this is the shape contract CUDA
+graphs require:
+- Log the `(batch, seq_len)` of every forward call across 100 requests — confirm only
+  bucket boundary values appear (64, 128, 256, 512, 1024), never arbitrary lengths.
+- Intentionally pass a shape outside a bucket boundary and observe the output corruption
+  that would happen if a graph were replayed with the wrong shape (demonstrates *why*
+  bucketing is a prerequisite, not just an optimization).
+
+→ Reference: `knowledge_base/CUDA_Graph.md` §3 (shape constraint), §4 (bucketing)
+
 ---
 
-### Phase 3 — Warm-up + Compilation
+### Phase 3 — Multiprocess Serving
+
+Build a real serving layer and implement multiprocess serving from scratch. Goal: understand how CPU and GPU work is split across processes, how the GIL limits single-process throughput, and how SO_REUSEPORT enables true parallelism.
+
+**Step 1 — Single-process FastAPI server (baseline):**
+Wrap `model.generate()` in a FastAPI endpoint. One process, one GPU.
+- POST `/generate` with prompt → returns generated text + latency
+- Measure: requests/sec, p50/p99 latency, CPU utilization (single core), GPU utilization
+- Profile with torch.profiler: how much wall time is CPU preprocessing vs GPU compute?
+
+**Step 2 — Observe the GIL bottleneck:**
+Add multi-threading (`ThreadPoolExecutor`) to handle concurrent requests.
+- Send 10 concurrent requests, measure wall-clock time vs sequential
+- Observe: threads don't help for tokenization (CPU-bound) — same wall time as sequential
+- CPU monitor shows one core at 100%, rest idle → GIL in action
+
+**Step 3 — Multiprocess with SO_REUSEPORT:**
+Spawn N worker processes, each listening on the same port via `SO_REUSEPORT`.
+OS kernel distributes incoming connections across them — no application-level router needed.
+Each process has its own Python interpreter (own GIL) → true CPU parallelism.
+- N=4 workers, each preprocessing independently on its own core
+- All 4 share the single GPU (requests serialized at GPU level)
+- Measure: CPU utilization across all cores, requests/sec vs single-process
+- Observe: preprocessing parallelizes; GPU becomes the serialization point
+
+**Step 4 — Process-per-GPU (if multi-GPU available on Lambda):**
+One gRPC/FastAPI process paired with one GPU. Each process owns its GPU exclusively.
+- N processes = N GPUs, each process handles a full request end-to-end
+- No GPU serialization — each request gets a dedicated GPU
+- Measure: per-GPU throughput vs Step 3; observe GPU utilization improves
+- Load balancing: SO_REUSEPORT at OS level, or explicit round-robin router process
+
+**Step 5 — gc.freeze() tail latency:**
+After warmup (Step 3 or 4), call `gc.freeze()` and reload traffic.
+- Compare p99 latency before/after freeze
+- Observe: GC pause spikes disappear from the latency distribution
+
+**Step 6 (optional) — Split into gRPC servicer + model worker (LinkedIn architecture):**
+Separate CPU preprocessing and GPU inference into distinct process types:
+```
+Client → [gRPC servicer process]  ← handles HTTP, tokenization, feature encoding
+              ↓ gRPC call (protobuf)
+         [Model worker process]   ← owns GPU, runs model.generate(), returns logits
+              ↓
+         [gRPC servicer process]  ← decodes response, returns HTTP to client
+```
+- N gRPC servicer processes (CPU-only, no GPU) + M model worker processes (GPU-only)
+- Scale them independently: more servicers if preprocessing bottlenecks, more workers if GPU bottlenecks
+- gRPC between them: binary protobuf serialization, faster than HTTP for internal IPC
+- Implement with Python `grpc` library: define `.proto` schema (GenerateRequest, GenerateResponse),
+  compile with `protoc`, implement servicer and worker as separate scripts
+- Measure: can you saturate the GPU more fully by tuning N servicers vs M workers?
+- Compare to Step 3 (FastAPI all-in-one): same multiprocess concept, different IPC and separation of concerns
+
+**Key concepts implemented:**
+- `SO_REUSEPORT` — multiple processes bind the same port; OS kernel load-balances
+- `multiprocessing` vs `threading` — GIL bypass via separate processes
+- Process pinning (`os.sched_setaffinity`) — pin each worker to a dedicated CPU core
+- `gc.freeze()` — freeze permanent heap objects to eliminate GC scan pauses
+- GPU ownership per process — each worker calls `torch.cuda.set_device(rank)`
+
+**What to measure at each step:**
+
+| Config | CPU cores active | Requests/sec | p99 latency | GPU util |
+|---|---|---|---|---|
+| Single process | 1 | baseline | baseline | X% |
+| 4 threads | 1 (GIL) | ≈ baseline | ≈ baseline | X% |
+| 4 processes (SO_REUSEPORT, 1 GPU) | 4 | ~2–3× | lower | higher |
+| N processes (1 per GPU) | N | N× | lower | ~same per GPU |
+| + gc.freeze() | N | same | p99 drops | same |
+
+→ Reference: `knowledge_base/python_gil.md`
+
+---
+
+### Phase 4 — Warm-up + Compilation + CUDA Graphs
 
 **Warm-up:** before opening to traffic, run N dummy inference passes with each expected bucket shape. Absorbs CUDA kernel JIT compilation, memory allocator warm-up, and torch.compile tracing. Without this, first real requests are 10-100× slower than steady state.
 
@@ -76,6 +164,29 @@ Profile: compare first-request latency vs warm request latency. See the cliff.
 Profile after compile: kernel count drops, CUDA time for hot ops decreases, fewer gaps on GPU track.
 
 Key insight: warm-up and compile interact — warm-up triggers compilation for each bucket shape upfront so no real request ever pays the compilation cost.
+
+**CUDA Graph exercise:**
+
+Step 1 — Capture and replay a single graph:
+- Pre-allocate static input/output buffers for one bucket shape (e.g. seq_len=128)
+- Capture the full forward pass into a `torch.cuda.CUDAGraph`
+- Replay it 1000 times, measure CPU dispatch time vs eager mode
+- Expected: CPU overhead collapses from ~44ms/pass to ~5μs/pass
+
+Step 2 — Capture one graph per bucket:
+- For each bucket size (64, 128, 256, 512, 1024), capture one graph at startup
+- Route incoming requests to the correct graph by padding to nearest bucket
+- Profile: verify `cudaLaunchKernel` CPU time in profiler drops to near zero
+
+Step 3 — Verify shape safety:
+- Attempt to replay a graph with an input that was NOT pre-allocated in the static buffer
+  (allocate a new tensor and pass it) — observe the wrong-address failure
+- Confirms why `input.copy_(new_data)` is the correct pattern, not `input = new_data`
+
+Profile signal to watch: `cudaLaunchKernel` Self CPU (was 1.088s in Phase 1 baseline)
+should drop dramatically. Kernel count in profiler table should collapse to near 1.
+
+→ Reference: `knowledge_base/CUDA_Graph.md` §2 (capture/replay), §4 (bucketing)
 
 ---
 
@@ -160,7 +271,7 @@ We studied the [`vllm-tuner`](../Github_Repos/vllm-tuner/) repo (Bayesian optimi
 
 ---
 
-### Phase 7 — Containerization + Kubernetes
+### Phase 7 — Containerization + Kubernetes + Piecewise CUDA Graphs
 
 FastAPI inference server → Dockerfile with CUDA base image → Kubernetes Deployment.
 
@@ -177,6 +288,40 @@ Startup sequence inside pod:
   Readiness probe passes → Kubernetes routes traffic
 ```
 
+**Piecewise CUDA Graph exercise:**
+
+GPT-2 inference has a prompt structure with mixed static/dynamic segments — exactly
+what piecewise graphs are designed for:
+
+```
+[system prompt (fixed)] | [user query (variable)] | [generation (dynamic)]
+      ↑ same every call         ↑ bucketed              ↑ autoregressive
+```
+
+Step 1 — Identify stable vs dynamic segments:
+- Measure what fraction of compute each segment contributes (torch.profiler with NVTX ranges)
+- Confirm system prompt KV is recomputable identically every call
+
+Step 2 — Capture segment graphs separately:
+- Graph A: system prompt KV computation (fixed shape, capture once)
+- Graph B: per bucket query + scoring (one graph per bucket size)
+- Eager: generation loop (autoregressive, shape changes per step — keep eager)
+
+Step 3 — Stitch with stream sync points:
+- `graph_A.replay()` → `torch.cuda.synchronize()` → feed Graph A output into Graph B
+- `graph_B.replay()` → eager generation loop
+- Measure: dispatch overhead on stable segments drops to ~5μs; eager segment unchanged
+
+Step 4 — Compare to Phase 3 full-graph approach:
+- Full graph (Phase 3): works only when entire sequence is fixed shape
+- Piecewise (Phase 7): handles mixed static/dynamic — stable segments get graph speedup,
+  dynamic segments fall back to eager without breaking the stable ones
+
+Profile signal: per-segment CPU time breakdown (use NVTX range labels to separate
+system prompt, query, generation in the profiler output).
+
+→ Reference: `knowledge_base/CUDA_Graph.md` §5 (piecewise), §6 (MixLM interaction)
+
 ---
 
 ## What You Learn (Interview Summary)
@@ -184,12 +329,12 @@ Startup sequence inside pod:
 | Phase | Core skill | Talking point |
 |-------|-----------|---------------|
 | 1 | Read profiler output, identify hot ops | "torch.profiler showed 70% of CUDA time in aten::mm — memory-bound at batch size 1" |
-| 2 | Batching tradeoffs | "Bucketing controls shape for compilation stability; dynamic batching controls batch size for GPU utilization — production needs both" |
-| 3 | Warm-up + compilation | "Warm-up over all bucket shapes triggers torch.compile tracing upfront — no real request ever pays the compilation cost" |
+| 2 | Batching + shape contract | "Bucketing fixes the shape space — confirmed only bucket boundary values (64,128,256…) appear across 100 requests; this is the prerequisite for CUDA graph capture" |
+| 3 | CUDA graphs + warm-up | "Captured one graph per bucket at startup — CPU dispatch overhead collapsed from 44ms to 5μs per forward pass; warm-up triggers capture so no live request pays the compilation cost" |
 | 4 | KV cache from scratch | "Replaced aten::cat with pre-allocated buffer — eliminated 1.12 GB cumulative copy cost; then implemented block-based allocation to remove memory bubble" |
 | 5 | Quantization hands-on | "AWQ INT4 gave 3x memory reduction with <1% perplexity increase; KV cache INT8 let us double max batch size" |
 | 6 | Nsight roofline | "Nsight Compute placed GPT-2 below the memory roofline at batch size 1; FP8 shifted it toward compute-bound" |
-| 7 | GPU workloads on Kubernetes | "Readiness probe gates traffic until warm-up completes — prevents first-request latency spikes in production" |
+| 7 | Piecewise CUDA graphs + Kubernetes | "Split prompt into stable (system prompt) and dynamic (query, generation) segments — captured graphs for stable segments, stitched with stream sync points; readiness probe gates traffic until all bucket graphs are captured and warmed up" |
 
 ---
 

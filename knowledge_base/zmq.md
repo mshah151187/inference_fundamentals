@@ -131,15 +131,72 @@ Client (DEALER) ──→ Router ──→ Worker (DEALER)
 ### PUB / SUB — Broadcast
 
 ```
-Publisher (PUB) ──→ [all subscribers]
-Subscriber 1 (SUB)
-Subscriber 2 (SUB)
+Publisher (PUB) ──→ [all subscribers simultaneously]
+                 ├──→ Subscriber 1 (SUB)
+                 ├──→ Subscriber 2 (SUB)
+                 └──→ Subscriber 3 (SUB)
 ```
 
-- PUB sends to all connected SUBs
-- SUBs can filter by topic prefix
-- One-way, no acknowledgement
-- Good for metrics, log streaming, config updates
+- PUB sends each message to ALL connected SUBs simultaneously
+- One-way, no acknowledgement, no reply
+- Good for: slot-index notification to multiple readers, metrics streaming, config broadcast
+
+**vs PUSH/PULL:**
+
+| | PUSH / PULL | PUB / SUB |
+|---|---|---|
+| Delivery | round-robin — one receiver per message | broadcast — every subscriber per message |
+| Use when | work queue (load balance tasks) | broadcast (every consumer needs every message) |
+
+**The mandatory SUBSCRIBE call:**
+
+```python
+# Publisher (binds)
+pub = ctx.socket(zmq.PUB)
+pub.bind("ipc:///tmp/notify.ipc")
+
+# Subscriber (connects) — MUST call setsockopt before any recv()
+sub = ctx.socket(zmq.SUB)
+sub.connect("ipc:///tmp/notify.ipc")
+sub.setsockopt(zmq.SUBSCRIBE, b"")   # b"" = subscribe to ALL messages
+                                      # b"metrics" = only messages starting with "metrics"
+# Without setsockopt(SUBSCRIBE), the SUB socket receives NOTHING — silent drop
+```
+
+**Topic filtering:**
+
+```python
+# Publisher sends with a topic prefix
+pub.send(b"metrics " + data)
+pub.send(b"alert "   + data)
+
+# Subscriber A — only wants metrics
+sub_a.setsockopt(zmq.SUBSCRIBE, b"metrics")
+
+# Subscriber B — wants everything
+sub_b.setsockopt(zmq.SUBSCRIBE, b"")
+```
+
+Filtering happens inside the PUB socket before sending — subscribers that don't
+match the prefix never receive the bytes. In our SHM pipeline, we use `b""` (no filter)
+because the slot_idx notification is always relevant to every reader.
+
+**The slow joiner problem:**
+
+```
+Timeline:
+  t=0  PUB binds and starts sending
+  t=1  SUB connects
+  t=2  SUB calls setsockopt(SUBSCRIBE, b"")
+
+Messages sent at t=0..1 are DROPPED — the SUB was not connected yet.
+ZMQ PUB has no message queue for late-joining subscribers.
+```
+
+Fix: ensure SUB connects and subscribes BEFORE PUB starts sending. In our
+pipeline, startup order in `main_shm.py` is: Scheduler (SUB) first, then
+Tokenizer (PUB). With a 1-second stagger between each process start, the SUB
+is subscribed well before the PUB sends its first message.
 
 ### PAIR — Exclusive Pair
 
@@ -322,7 +379,68 @@ Results (output token IDs) come back via a separate PULL socket in the other dir
 
 ---
 
-## 11. Staff+ Interview Angles
+## 11. Poller — Watching Multiple Sockets Simultaneously
+
+A ZMQ socket's `.recv()` blocks until a message arrives. When a process owns
+multiple sockets, blocking on one means missing messages from the others.
+
+`zmq.Poller` solves this — it asks the OS: "which of my registered sockets
+have data ready right now?" and returns immediately.
+
+```python
+poller = zmq.Poller()
+poller.register(notify_socket, zmq.POLLIN)   # watch for incoming messages
+poller.register(result_socket, zmq.POLLIN)
+
+ready = dict(poller.poll(timeout=0))         # timeout=0 = non-blocking
+
+if notify_socket in ready:
+    slot_idx = notify_socket.recv()          # guaranteed not to block
+if result_socket in ready:
+    result  = result_socket.recv()
+```
+
+**`timeout` values:**
+
+| Value | Behaviour |
+|---|---|
+| `0` | Return immediately — non-blocking check |
+| `N` (ms) | Wait up to N milliseconds |
+| `-1` / `None` | Block forever until at least one socket is ready |
+
+**How it works under the hood:**
+
+`poller.poll()` calls the OS `select()` / `epoll()` syscall on all registered
+file descriptors simultaneously. The OS wakes the process when any one of them
+has data — no busy-waiting.
+
+**Usage pattern in our scheduler:**
+
+```
+step():
+  1. poll(timeout=0) on notify_socket  ← non-blocking drain of all tokenizer messages
+  2. _schedule()                        ← decide what to run
+  3. dispatch_socket.send(batch)        ← send to GPU
+  4. result_socket.recv()               ← block here — always need GPU result before next step
+```
+
+Step 1 is non-blocking (drain everything queued from tokenizer).
+Step 4 is blocking (no point proceeding without GPU output).
+The Poller only appears in step 1 — where we need "check without blocking."
+
+**Without Poller — the deadlock:**
+
+```python
+# WRONG: blocks on notify_socket even if GPU responded first
+data   = notify_socket.recv()
+result = result_socket.recv()   # never reached if GPU responds first
+```
+
+Poller turns that into a safe, ordered check.
+
+---
+
+## 12. Staff+ Interview Angles
 
 **Q: Why not use a database or Redis as the queue between scheduler and GPU worker?**
 

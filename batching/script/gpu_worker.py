@@ -12,7 +12,7 @@ from typing import List
 
 import torch
 import zmq
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, BitsAndBytesConfig
 
 from block_pool import KVStore
 
@@ -28,6 +28,53 @@ NUM_LAYERS   = 12
 NUM_KV_HEADS = 12
 HEAD_DIM     = 64
 EOS_TOKEN_ID = 50256
+
+# ── Quantization mode ─────────────────────────────────────────────────────────
+# "none"     — default BF16/FP32, no quantization
+# "int8"     — bitsandbytes W8A16: weights in INT8, activations in BF16
+#              ~2× weight memory reduction, no accuracy loss, no calibration
+# "int4_nf4" — bitsandbytes W4A16: weights in NF4 (4-bit normal float),
+#              ~4× weight memory reduction, small accuracy loss, no calibration
+QUANT_MODE = "none"
+
+
+def _load_model(model_id: str, device: str) -> GPT2LMHeadModel:
+    """
+    Load GPT-2 with the quantization mode set by QUANT_MODE.
+
+    "none":     standard load → .to(device). weights stay in FP32/BF16.
+    "int8":     bitsandbytes W8A16. nn.Linear weights quantized to INT8 at load time.
+                device_map={"": device} replaces .to(device) — bnb handles placement.
+    "int4_nf4": bitsandbytes W4A16. weights quantized to NF4 (4-bit) per group of 64.
+                double_quant=True quantizes the scale factors too (~0.37 bits saved/param).
+
+    The forward pass (prefill, decode) is identical for all modes — bnb replaces
+    nn.Linear.forward() transparently with its own dequant+matmul kernel.
+    """
+    if QUANT_MODE == "none":
+        return GPT2LMHeadModel.from_pretrained(model_id).to(device).eval()
+
+    if QUANT_MODE == "int8":
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+
+    elif QUANT_MODE == "int4_nf4":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",            # non-uniform bins at normal quantiles
+            bnb_4bit_compute_dtype=torch.bfloat16, # dequantize to BF16 before matmul
+            bnb_4bit_use_double_quant=True,        # quantize scale factors too
+        )
+    else:
+        raise ValueError(f"Unknown QUANT_MODE: {QUANT_MODE!r}")
+
+    # device_map={"": device} puts all layers on the specified device.
+    # bitsandbytes requires device_map instead of .to(device) because it needs
+    # to intercept weight placement to install its quantized tensors.
+    return GPT2LMHeadModel.from_pretrained(
+        model_id,
+        quantization_config=bnb_config,
+        device_map={"": device},
+    ).eval()
 
 
 def _extract_kv_slice(past_key_values, batch_idx: int, seq_start: int,
@@ -57,8 +104,8 @@ class GPUWorker:
 
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[GPUWorker] loading GPT-2 on {self.device}...")
-        self.model = GPT2LMHeadModel.from_pretrained("gpt2").to(self.device).eval()
+        print(f"[GPUWorker] loading GPT-2 on {self.device} | quant={QUANT_MODE}...")
+        self.model = _load_model("gpt2", self.device)
 
         self.kv_store = KVStore(
             max_slots=MAX_SLOTS,

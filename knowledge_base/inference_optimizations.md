@@ -801,6 +801,27 @@ With PagedAttention — 16-token pages:
   → TTFT = just prefill_time (queue_wait eliminated)
 ```
 
+**Second benefit — fragmentation no longer blocks admission:**
+
+With naive KV cache, admission requires one *contiguous* block of `max_seq_len × N bytes`
+in HBM. Even if 30 GB is free, it may be fragmented into chunks smaller than one slot
+(36 MB) → the request waits despite plenty of total free memory.
+
+With PagedAttention, prefill only needs `ceil(prompt_len / page_size)` pages, and they
+can be scattered anywhere in HBM. For a 500-token prompt with 16-token pages:
+```
+Without PA: need 1 contiguous 36 MB block (max_seq_len=1024 reserved upfront)
+            → blocked if HBM is fragmented, even with 10 GB free
+
+With PA:    need ceil(500/16) = 32 scattered 576 KB pages (prompt tokens only)
+            → any 32 free pages work regardless of where they sit in HBM
+            → generation steps allocate 1 more page at a time as tokens are produced
+```
+
+This means two things:
+1. **No fragmentation penalty** — HBM utilization stays high even after many requests complete and return pages in arbitrary order
+2. **Lower admission threshold** — you only need pages for the actual prompt, not for the full potential output length; generation pages are allocated lazily one step at a time
+
 ---
 
 #### Disaggregated Prefill / Decode — Eliminate prefill-decode interference at cluster level

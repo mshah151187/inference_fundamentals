@@ -78,6 +78,104 @@ FP16 (Tensor cores): 312  TFLOPS / 1,555 GB/s ≈ 200 FLOPs/byte
 Two ridge points because FP32 vs FP16 use different compute ceilings.
 Our GPT-2 run is FP32 → ridge point ≈ 13 FLOPs/byte.
 
+**The ridge point is NOT the theoretical maximum AI — it is the minimum AI needed
+to be compute-bound.** Think of it as a threshold, not a ceiling:
+
+```
+AI < ridge point  → memory-bound  (memory bus is the bottleneck, more compute won't help)
+AI > ridge point  → compute-bound (compute is the bottleneck, more bandwidth won't help)
+AI = ridge point  → perfect balance — both ceilings met simultaneously
+
+Arithmetic Intensity has no theoretical maximum — it depends on the algorithm.
+A kernel that loads data once and performs heavy math on it can have AI in the thousands.
+The ridge point only tells you: once AI crosses this threshold, memory is no longer
+the bottleneck and compute becomes the limiting factor.
+```
+
+---
+
+## Interpreting Observed AI — Is the Kernel Genuinely Memory-Bound?
+
+The roofline tells you WHERE the bottleneck is, not WHETHER the kernel is optimal.
+A kernel with bugs or inefficiencies can also appear memory-bound. Before acting on
+the roofline, verify the kernel is doing the right amount of work.
+
+**Step 1 — Calculate theoretical values by hand:**
+
+```
+For matmul (M×K) × (K×N):
+  Theoretical FLOPs = 2 × M × N × K
+  Theoretical bytes = (M×K + K×N + M×N) × bytes_per_element
+  Theoretical AI    = FLOPs / bytes
+```
+
+**Step 2 — Compare against NCU measured values:**
+
+```
+Scenario                        Meaning                       Action
+────────────────────────────────────────────────────────────────────────────────
+Measured ≈ theoretical          Kernel doing correct work     Trust roofline,
+(FLOPs match, bytes match)      Genuinely memory-bound        optimize bandwidth
+
+Measured FLOPs >> theoretical   Wasted computation            Fix kernel first —
+                                Redundant ops, warp           divergent branches,
+                                divergence, extra passes      unnecessary work
+
+Measured bytes >> theoretical   Non-coalesced memory access   Fix access pattern —
+                                Threads reading scattered      stride-1 access,
+                                addresses → extra cache        reorder data layout
+                                lines loaded from HBM
+```
+
+**Non-coalesced access example (bytes >> theoretical):**
+
+Cache line = 128 bytes = 32 floats. Hardware always loads a full cache line.
+
+```
+Coalesced (32 threads, consecutive addresses):
+  All 32 threads' data fits in 1 cache line → 1 HBM load
+  Bytes loaded = 128 (exactly what's needed)
+
+Non-coalesced (32 threads, stride-128 addresses):
+  Each thread's float is in a different cache line → 32 HBM loads
+  Bytes loaded = 32 × 128 = 4,096 (32× more than needed)
+  → measured bytes >> theoretical bytes
+  → AI appears 32× lower than it should be
+  → kernel looks more memory-bound than it truly is
+```
+
+**Rule:** Always verify measured FLOPs and bytes against theoretical before
+concluding a kernel is genuinely memory-bound and acting on it.
+
+---
+
+**Scenario 1: Observed AI = 12, Ridge Point = 13 (FP32)**
+
+```
+Theoretical AI = 13  (FP32 ridge point — balanced compute and memory)
+Observed AI    = 12  (just below ridge — appears memory-bound)
+
+AI = FLOPs / Bytes → lower AI means fewer FLOPs OR more Bytes
+
+Step 1: Check FLOPs
+  Measured FLOPs ≈ theoretical  → compute doing the right amount of work
+                                 → FLOPs are not the cause
+
+Step 2: Therefore Bytes must be higher than theoretical
+  Measured bytes > theoretical  → loading more data from HBM than needed
+                                 → classic sign of non-coalesced access
+
+Step 3: Confirm access pattern
+  Threads reading scattered addresses → each thread pulls a different 128-byte cache line
+  Only 4 bytes used per cache line, 124 bytes wasted
+  → HBM traffic >> what algorithm actually needs
+  → AI drops below theoretical
+
+Fix: reorder data layout or restructure thread-to-address mapping
+     so consecutive threads read consecutive addresses (coalesced)
+     → bytes drop back to theoretical → AI rises to 13 → ridge point reached
+```
+
 ---
 
 ## Three Regions — Three Diagnoses

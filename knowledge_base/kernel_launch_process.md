@@ -247,255 +247,43 @@ The CPU stays busy dispatching the next kernel while the GPU works on the curren
 
 ---
 
-## How torch.compile Eliminates This
+## How torch.compile + CUDA Graphs Eliminate This
 
 In eager mode: 140K separate `cudaLaunchKernel` calls = 1.088s CPU overhead.
 
-`torch.compile` with CUDA graphs:
-```
-First call (trace):
-  PyTorch records all kernel launches for one forward pass into a CUDA Graph
-  Cost: same as eager + graph capture overhead
+`torch.compile` with CUDA graphs records all kernel launches for one forward pass
+into a graph, then replays the entire forward pass with a single `cudaGraphLaunch()`
+call — CPU overhead collapses from 1.088s to near zero.
 
-Subsequent calls (replay):
-  Single cudaGraphLaunch() replays all kernels
-  CPU cost: ~1 cudaGraphLaunch call instead of 140K cudaLaunchKernel calls
-  Dispatch overhead: ~microseconds instead of ~1 second
-```
+### What changes per step — eager vs CUDA graph replay
 
-The GPU executes the exact same kernels — but the CPU overhead collapses from
-1.088s to near zero. This is Phase 3 of the project.
+The 7-step pipeline runs fully during **capture** (once). During **replay** it is
+almost entirely bypassed:
 
----
+| Step | Eager mode | CUDA graph replay |
+|---|---|---|
+| 1. Python dispatch | `torch.addmm()` → pybind11 per op | `g.replay()` — one call, no op dispatch |
+| 2. PyTorch Dispatcher | table lookup per op | skipped entirely |
+| 3. C++ implementation | shape validation + output allocation | skipped — shapes baked in, buffers pre-allocated |
+| 4. cuBLAS algorithm selection | cache lookup per shape | skipped — variant baked into graph node at capture |
+| 5. cudaLaunchKernel | called N times (140K in our run) | replaced by single `cudaGraphLaunch()` |
+| 6. GPU execution | tensor core GEMM | **identical** — same kernels, same grid dims |
 
-## CUDA Graph — How It Works
+Steps 1–5 are pure CPU pipeline — completely eliminated during replay.
+Step 6 (GPU execution) is identical in both modes.
 
-### The problem it solves
+**Key mental model:** CUDA graphs don't make the GPU faster. They make the CPU get
+out of the way faster. The GPU was always capable of running those kernels efficiently
+— the bottleneck was the CPU spending 44ms dispatching them one by one. Graph replay
+hands the GPU the full work order upfront in one 5μs call.
 
-Every kernel launch in eager mode follows the full CPU pipeline:
-Python → Dispatcher → C++ → cudaLaunchKernel → GPU stream queue.
-At batch=1 this overhead (~28μs per op) exceeds GPU execution time (~13.7μs).
-For a 32-layer transformer with ~50 ops per layer that's 1,600 kernel launches per
-forward pass — over 44ms of pure CPU dispatch cost on every decode step.
-
-### Capture phase — record, don't execute
-
-```python
-# Warm up first (cuBLAS algorithm cache, allocations)
-for _ in range(3):
-    output = model(input_ids)
-
-# Capture: GPU goes into record mode
-g = torch.cuda.CUDAGraph()
-with torch.cuda.graph(g):
-    output = model(input_ids)   # no GPU execution happens here
-                                # CPU records the sequence of kernel launches
-                                # into a graph data structure
-```
-
-During capture, CUDA intercepts every `cudaLaunchKernel` call and logs it as a
-node in a DAG (directed acyclic graph) with edges representing dependencies:
-
-```
-Graph nodes (each = one kernel + its args):
-  [embedding_lookup] → [layernorm_0] → [addmm_qkv] → [attention] → [addmm_out]
-                                ↓
-                          [addmm_mlp1] → [gelu] → [addmm_mlp2]
-                                                        ↓
-                                                  [layernorm_32] → [lm_head]
-```
-
-Tensor pointers (addresses) are baked into the graph nodes at capture time.
-The input and output tensors must be pre-allocated and reused across replays.
-
-### Replay phase — single call, full forward pass
-
-```python
-# Update input in-place (same memory address, new values)
-input_ids.copy_(new_token_ids)
-
-# Replay: entire forward pass in one API call
-g.replay()
-# CPU cost: one cudaGraphLaunch (~5μs) instead of 1,600 cudaLaunchKernel calls
-# GPU executes the exact same kernels in the exact same order
-```
-
-```
-Eager mode:
-  CPU: [launch][launch][launch]...[launch]  ← 1,600 calls × 28μs = 44ms CPU
-  GPU:         [k1][k2][k3]...[k1600]
-
-CUDA Graph:
-  CPU: [graphLaunch]                         ← 1 call × 5μs = 5μs CPU
-  GPU: [k1][k2][k3]...[k1600]               ← identical GPU execution
-```
-
-GPU execution is identical. CPU overhead collapses from 44ms to 5μs.
-
-### Why decode works but prefill doesn't
-
-CUDA Graph requires the computation graph to be **structurally identical** across
-replays — same kernels, same tensor shapes, same data flow.
-
-```
-Decode (one token per step):
-  Input shape: [batch, 1]          ← fixed every step
-  KV cache shape: grows, but attention kernel shape is fixed if batch is fixed
-  Computation graph: identical every step
-  → CUDA Graph works ✓
-
-Prefill (process full prompt):
-  Input shape: [batch, prompt_len]  ← different per request
-  prompt_len = 47? 512? 1024?       ← changes every request
-  Computation graph: different shapes → different kernel variants selected
-  → CUDA Graph cannot be reused ✗
-```
-
-### How vLLM uses CUDA Graph
-
-vLLM captures **multiple graphs** — one per batch size — to handle variable
-incoming request counts during decode:
-
-```
-At startup, vLLM captures graphs for batch sizes: [1, 2, 4, 8, 16, 32, ...]
-
-Incoming decode step with 5 requests:
-  → pad to batch=8 (next captured size)
-  → replay graph captured for batch=8
-  → ignore padded output rows
-
-Prefill: always runs in eager mode (variable prompt lengths)
-Decode:  always runs via CUDA Graph (fixed shape per captured batch size)
-```
-
-The padding overhead (running batch=8 instead of batch=5) is small compared to
-the dispatch savings from graph replay.
-
-### Constraint — tensors must be pre-allocated
-
-Because tensor addresses are baked into graph nodes at capture time, you cannot
-allocate new tensors during replay. All inputs, outputs, and intermediate buffers
-must be allocated before capture and reused across replays.
-
-```python
-# Pre-allocate before capture
-static_input  = torch.zeros(batch, seq_len, dtype=torch.long, device='cuda')
-static_output = torch.zeros(batch, vocab_size, dtype=torch.float, device='cuda')
-
-# Capture with these static tensors
-with torch.cuda.graph(g):
-    static_output = model(static_input)
-
-# Each decode step: copy new data into pre-allocated buffers, then replay
-static_input.copy_(new_token_ids)
-g.replay()
-logits = static_output  # read result from pre-allocated buffer
-```
-
-This is why vLLM's decode loop looks different from a naive inference loop —
-it manages a pool of static buffers rather than allocating tensors per request.
-
----
-
-## Why Shape Matters and Why Bucketing Helps
-
-### Shape is baked into three things simultaneously
-
-When a CUDA Graph node is captured for an `addmm` kernel, the capture records:
-
-```
-addmm at capture time — seq_len=50, batch=1, hidden=768:
-  (M, K, N) = (50, 768, 768)
-
-  1. Kernel variant  — cuBLAS selects Variant B (tile 32×32) for this shape
-  2. Grid dimensions — ceil(50/32) × ceil(768/32) = 2 × 24 = 48 thread blocks
-  3. Tensor args     — M=50, N=768, K=768 baked into kernel arguments
-
-All three are recorded in the graph node at capture time.
-```
-
-If you replay this graph with `seq_len=100` (M=100):
-```
-Grid dims replayed: (2, 24, 1)  ← still 48 thread blocks for only rows 0..49
-Rows 50..99: never computed — no thread blocks assigned to them
-Output: silently wrong, no error raised
-```
-
-The GPU doesn't validate shapes at replay time. It just executes what was recorded.
-
-### Why every unique shape needs its own graph
-
-For a transformer layer, every `addmm` shape is a function of `(batch_size, seq_len)`:
-
-```
-QKV projection:    (batch × seq_len,  hidden) × (hidden, 3×hidden)
-Output projection: (batch × seq_len,  hidden) × (hidden,   hidden)
-MLP fc1:           (batch × seq_len,  hidden) × (hidden, 4×hidden)
-MLP fc2:           (batch × seq_len, 4×hidden) × (4×hidden, hidden)
-```
-
-Change either `batch_size` or `seq_len` → `M` changes in every kernel →
-different cuBLAS variant selected → different grid dims → need a new capture.
-
-One captured graph is valid for exactly one `(batch_size, seq_len)` pair.
-
-### Bucketing — fix the shape space so graphs can be pre-captured
-
-Without bucketing, seq_len can be anything from 1 to max_context (e.g., 8192).
-You can't pre-capture 8192 different graphs at startup — too much memory and
-capture time.
-
-Bucketing collapses the continuous shape space into a small fixed set:
-
-```
-Bucket sizes (example):  [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-
-Incoming request with seq_len=100:
-  → round UP to nearest bucket: 128
-  → pad input to seq_len=128 (fill with dummy tokens)
-  → replay graph captured for seq_len=128
-  → discard padded output positions
-```
-
-At startup, vLLM captures one CUDA Graph per bucket size — 10 captures instead
-of 8192. Each capture pre-runs cuBLAS algorithm selection and locks in the right
-kernel variant and grid dims for that bucket's shape.
-
-```
-Startup (once):
-  capture graph for seq_len=1    → graph_1
-  capture graph for seq_len=2    → graph_2
-  ...
-  capture graph for seq_len=512  → graph_512
-
-Per decode step (seq_len=100):
-  → select graph_128
-  → copy padded input into static buffer
-  → graph_128.replay()           ← 5μs CPU, correct grid dims for M=128
-```
-
-### The padding waste tradeoff
-
-Bucketing trades compute waste for dispatch efficiency:
-
-```
-seq_len=100 padded to bucket 128:
-  Wasted compute: 28 extra token positions processed = 22% overhead
-  Dispatch saving: 44ms eager CPU overhead → 5μs graph replay
-
-At inference scale (thousands of requests/sec), the dispatch saving dominates.
-Padding waste is bounded by the bucket granularity — finer buckets = less waste
-but more graphs to capture and more GPU memory for static buffers.
-```
-
-Coarser buckets (powers of 2) are common because the wasted compute is at most
-2× (worst case: seq_len just above the previous bucket) and the number of graphs
-stays small (log2(max_seq_len) graphs total).
+→ Full explanation, bucketing, and piecewise graphs: **`CUDA_Graph.md`**
 
 ---
 
 ## Relationship to Other Knowledge Base Docs
 
+- `CUDA_Graph.md` — how CUDA graphs work, shape constraints, bucketing, piecewise execution
 - `profiling_guide.md` — how to measure and interpret CPU vs CUDA time ratios
 - `kv_cache.md` — aten::cat is a separate kernel launch per decode step (same pipeline)
 - `PagedAttention.md` — eliminates aten::cat kernel launches entirely

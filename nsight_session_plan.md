@@ -86,36 +86,37 @@ memory bandwidth, arithmetic intensity, roofline position.
 Answers "why is this specific kernel slow at the hardware level?"
 
 **Note:** ncu is much slower than normal execution (10–100× overhead per kernel).
-Profile only a subset of kernels — not the full inference loop.
+Two flags are critical to avoid hour-long runs:
+- `--launch-count N` — stop after profiling N matching kernel invocations (without this, ncu profiles every invocation in the entire script — hundreds of them)
+- `--kernel-name regex` — only profile kernels whose name matches the pattern (skip unrelated kernels entirely)
+- `--set basic` — collect only the core counter set (SM throughput, memory throughput, occupancy); much faster than `--set full`
 
-### Step 1 — Quick summary (all kernels, lightweight metrics)
-
-```bash
-ncu \
-  --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,\
-l1tex__t_bytes.sum.per_second,\
-sm__sass_thread_inst_executed_op_ffma_pred_on.sum \
-  --target-processes all \
-  --output /home/ubuntu/inference_fundamentals/nsight/ncu_summary_batch1 \
-  --force-overwrite \
-  python /home/ubuntu/inference_fundamentals/torch_profiler/script/inference_profile.py
-```
-
-### Step 2 — Deep dive on addmm kernel (full roofline)
+### Step 1 — Capture inference kernels (gemv matmuls + attention + layer_norm)
 
 ```bash
-ncu \
-  --kernel-name "ampere_sgemm\|gemv\|fmha_cutlass" \
-  --metrics gpu__time_duration.sum,\
-sm__throughput.avg.pct_of_peak_sustained_elapsed,\
-l1tex__t_bytes.sum.per_second,\
-sm__sass_thread_inst_executed_op_ffma_pred_on.sum,\
-sm__warps_active.avg.pct_of_peak_sustained_active,\
-gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed \
-  --output /home/ubuntu/inference_fundamentals/nsight/ncu_deep_batch1 \
+sudo env "PATH=$PATH" ncu \
+  --kernel-name "gemv2T_kernel_val|gemvNSP_kernel|enable_if|layer_norm" \
+  --launch-count 10 \
+  --set full \
+  -o /home/ubuntu/inference_fundamentals/nsight/ncu_gemv_batch1 \
   --force-overwrite \
-  python /home/ubuntu/inference_fundamentals/torch_profiler/script/inference_profile.py
+  python3 /home/ubuntu/inference_fundamentals/nsys_profiler/script/inference_nsys.py
 ```
+
+**Critical correctness notes:**
+- `sudo env "PATH=$PATH"` — required; sudo resets PATH losing the custom ncu install
+- `|` not `\|` — ncu uses ERE alternation; backslash causes zero matches (no output file)
+- `enable_if` not `fmha_cutlass` — at batch=1 FP32 the attention kernel is a CUTLASS template (`std::enable_if<...>`); `fmha_cutlass` only appears for FP16
+- Use `inference_nsys.py` not `inference_profile.py` — torch.profiler causes CUPTI conflict
+- `--set full` gives roofline data, warp stall reasons, arithmetic intensity (~15-20 min with kernel filter)
+
+### Step 2 — Download to Mac
+
+```bash
+scp ubuntu@<ip>:/home/ubuntu/inference_fundamentals/nsight/ncu_gemv_batch1.ncu-rep ~/Downloads/
+```
+
+Open in Nsight Compute GUI → analyze SM throughput %, memory throughput %, roofline position per kernel.
 
 ### Key metrics explained
 
@@ -158,8 +159,8 @@ fmha_cutlass (attention):  ~8 FLOPs/byte  → memory-bound at short seq_len
 □ 2. Restore from filesystem snapshot (avoids re-downloading GPT-2)
 □ 3. mkdir -p /home/ubuntu/inference_fundamentals/nsight
 □ 4. Run nsys profile command → nsys_batch1.nsys-rep
-□ 5. Run ncu summary command → ncu_summary_batch1.ncu-rep
-□ 6. Run ncu deep dive command → ncu_deep_batch1.ncu-rep
+□ 5. Run ncu summary command (--launch-count 3, --set basic) → ncu_summary_batch1.ncu-rep  [~5 min]
+□ 6. Run ncu deep dive command (--launch-count 1, --set full) → ncu_deep_batch1.ncu-rep    [~10 min]
 □ 7. Download all three .rep files to Mac
 □ 8. Open nsys_batch1.nsys-rep in Nsight Systems GUI
 □ 9. Open ncu_deep_batch1.ncu-rep in Nsight Compute GUI
