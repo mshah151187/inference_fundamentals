@@ -53,6 +53,13 @@ def _load_llama(device: str) -> AutoModelForCausalLM:
             token=hf_token,
         ).to(device).eval()
 
+    if QUANT_MODE == "fp16":
+        return AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            torch_dtype=torch.float16,
+            token=hf_token,
+        ).to(device).eval()
+
     if QUANT_MODE == "int8":
         bnb_config = BitsAndBytesConfig(load_in_8bit=True)
     elif QUANT_MODE == "int4_nf4":
